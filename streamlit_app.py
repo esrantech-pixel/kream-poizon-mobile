@@ -5,8 +5,10 @@ import streamlit as st
 import requests
 from PIL import Image, ImageOps, ImageEnhance
 import pytesseract
+from openai import OpenAI
+import base64
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V14 FIELD', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON 역소싱 V15 AI', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -983,6 +985,111 @@ def _extract_product_fields(ocr_text):
     return {"brand":brand,"model":model,"name":name,"buy_price":buy_price,
             "retail_price":retail_price,"discount":discount,"sizes":", ".join(sizes[:12])}
 
+
+def _uploaded_to_data_url(uploaded, max_side=1600, quality=86):
+    """Convert Streamlit camera/upload image to a compact JPEG data URL."""
+    if uploaded is None:
+        return None
+    raw = uploaded.getvalue() if hasattr(uploaded, "getvalue") else uploaded.read()
+    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    if max(img.size) > max_side:
+        ratio = max_side / max(img.size)
+        img = img.resize((max(1, int(img.width * ratio)), max(1, int(img.height * ratio))))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return "data:image/jpeg;base64," + b64
+
+def _parse_ai_json(text):
+    s = str(text or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.I)
+        s = re.sub(r"\s*```$", "", s)
+    # tolerate explanatory text around the JSON
+    a, b = s.find("{"), s.rfind("}")
+    if a >= 0 and b > a:
+        s = s[a:b+1]
+    return json.loads(s)
+
+def _ai_product_vision(img_price, img_label):
+    """Use OpenAI vision to understand price sign + box label semantically."""
+    try:
+        api_key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
+    except Exception:
+        api_key = ""
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY가 Streamlit Secrets에 없습니다.")
+
+    content = [{
+        "type": "input_text",
+        "text": """
+당신은 한국 아울렛/리셀 현장 소싱 보조입니다.
+첨부 이미지에서 상품 정보를 읽고 의미를 구분하세요.
+
+반드시 JSON 객체 하나만 반환하세요. 설명문/마크다운 금지.
+
+필드:
+{
+  "brand": "브랜드, 모르면 빈 문자열",
+  "model": "스타일코드/품번. 예: HQ2197-600. 확실하지 않으면 빈 문자열",
+  "name": "상품명. 모델코드 제외",
+  "color": "색상명",
+  "buy_price": 0,
+  "retail_price": 0,
+  "discount": "",
+  "kr_sizes": ["260","265"],
+  "confidence": 0,
+  "warnings": []
+}
+
+판독 규칙:
+- buy_price = 매장에서 지금 실제로 지불할 판매/할인가.
+- retail_price = 정상가/정가. SALE 표지에서 원래 가격과 할인 가격을 구분.
+- discount = 할인율 숫자만 문자열로. 예: "50".
+- 박스 라벨의 CM 사이즈는 KR mm로 변환. CM 26 -> 260, CM 26.5 -> 265.
+- 신발 박스에 남성/여성 사이즈가 같이 있으면 실제 박스에 표시된 CM 값들을 kr_sizes에 기록.
+- 숫자가 보인다고 가격으로 추측하지 말 것.
+- 품번은 영문+숫자 스타일코드 패턴을 우선하며, 확실하지 않으면 빈 문자열.
+- 이미지에 없는 값은 만들어내지 말 것.
+- confidence는 전체 판독 확신도 0~100.
+- 모호하거나 잘린 부분은 warnings에 한국어로 적을 것.
+"""
+    }]
+
+    if img_price is not None:
+        content += [
+            {"type": "input_text", "text": "첫 번째 이미지: 상품과 가격표/할인표 이미지입니다."},
+            {"type": "input_image", "image_url": _uploaded_to_data_url(img_price), "detail": "high"},
+        ]
+    if img_label is not None:
+        content += [
+            {"type": "input_text", "text": "두 번째 이미지: 상품 박스 라벨/품번/사이즈 이미지입니다."},
+            {"type": "input_image", "image_url": _uploaded_to_data_url(img_label), "detail": "high"},
+        ]
+
+    client = OpenAI(api_key=api_key)
+    response = client.responses.create(
+        model="gpt-5.6-luna",
+        input=[{"role": "user", "content": content}],
+        max_output_tokens=1200,
+    )
+    data = _parse_ai_json(response.output_text)
+
+    # normalize
+    result = {
+        "brand": str(data.get("brand") or "").strip(),
+        "model": str(data.get("model") or "").strip().upper(),
+        "name": str(data.get("name") or "").strip(),
+        "color": str(data.get("color") or "").strip(),
+        "buy_price": int(data.get("buy_price") or 0),
+        "retail_price": int(data.get("retail_price") or 0),
+        "discount": str(data.get("discount") or "").replace("%", "").strip(),
+        "sizes": ", ".join(str(x).strip() for x in (data.get("kr_sizes") or []) if str(x).strip()),
+        "confidence": int(data.get("confidence") or 0),
+        "warnings": data.get("warnings") or [],
+    }
+    return result
+
 def send_telegram_message(text):
     """Send a Telegram message using Streamlit secrets via requests."""
     try:
@@ -1045,7 +1152,7 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V14 FIELD')
+st.title('KREAM · POIZON 역소싱 V15 AI')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -1064,9 +1171,9 @@ tf,t0,t1,t2,t3,t4,t5,t6=st.tabs(['📸 현장 카메라','🔥 POIZON 후보발�
 
 
 with tf:
-    st.subheader("📸 현장 카메라 판정 V14")
-    st.caption("가격표/상품 사진과 박스 라벨을 찍으면 품번·가격·사이즈를 1차 자동 인식합니다. 인식값은 반드시 확인·수정 후 저장하세요.")
-    st.info("현장 권장: ① 가격표/상품 사진 1장 + ② 박스 라벨 1장. 같은 상품을 두 장 찍으면 인식률이 좋아집니다.")
+    st.subheader("📸 현장 AI 카메라 판정 V15")
+    st.caption("가격표/상품 사진 + 박스 라벨 사진을 AI가 함께 보고 품번·상품명·정상가·실제 매입가·사이즈를 의미별로 구분합니다.")
+    st.info("현장 권장: ① 상품+가격표가 한 화면에 보이게 1장  ② 박스 라벨을 가까이서 1장. 사진첩 업로드도 촬영과 똑같이 분석됩니다.")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1079,36 +1186,56 @@ with tf:
     img1 = photo_price or upload_price
     img2 = photo_label or upload_label
 
-    if st.button("🤖 사진 자동 인식", type="primary", width="stretch", key="field_ocr_button"):
+    if st.button("✨ AI 사진 자동 인식", type="primary", width="stretch", key="field_ai_button"):
         if img1 is None and img2 is None:
             st.warning("먼저 가격표 또는 박스 라벨 사진을 1장 이상 넣어주세요.")
         else:
-            with st.spinner("사진 글자를 읽는 중입니다..."):
-                text1, status1 = _ocr_text(img1)
-                text2, status2 = _ocr_text(img2)
-                combined = (text1 + "\n" + text2).strip()
-                st.session_state["field_ocr_raw"] = combined
-                st.session_state["field_ocr_status"] = f"① {status1} / ② {status2}"
-                f = _extract_product_fields(combined)
-                for k, v in f.items():
-                    st.session_state[f"field_{k}"] = v
-            if combined:
-                if f.get("model") or f.get("buy_price") or f.get("brand"):
-                    st.success("사진 인식 완료. 아래 값이 맞는지 확인해 주세요.")
+            try:
+                with st.spinner("AI가 가격표와 박스 라벨을 함께 분석하고 있습니다..."):
+                    f = _ai_product_vision(img1, img2)
+                    for k in ["brand","model","name","buy_price","retail_price","discount","sizes"]:
+                        st.session_state[f"field_{k}"] = f.get(k, "")
+                    st.session_state["field_ai_confidence"] = f.get("confidence", 0)
+                    st.session_state["field_ai_warnings"] = f.get("warnings", [])
+                    st.session_state["field_ai_color"] = f.get("color", "")
+                conf = int(f.get("confidence", 0) or 0)
+                if conf >= 80 and f.get("model") and f.get("buy_price"):
+                    st.success(f"AI 인식 완료 · 신뢰도 {conf}% — 아래 값만 눈으로 확인해 주세요.")
+                elif conf >= 55:
+                    st.warning(f"AI 인식 완료 · 신뢰도 {conf}% — 일부 항목은 꼭 확인해 주세요.")
                 else:
-                    st.warning("글자는 읽었지만 품번/가격을 확실하게 찾지 못했습니다. 가격표와 박스 라벨을 가까이서 다시 찍어주세요.")
-            else:
-                st.error("사진에서 글자를 읽지 못했습니다. 아래 OCR 상태를 확인해 주세요.")
+                    st.warning(f"AI 인식 신뢰도 {conf}% — 품번/가격을 직접 확인해 주세요.")
+            except Exception as e:
+                msg = str(e)
+                if "insufficient_quota" in msg or "billing" in msg.lower() or "quota" in msg.lower():
+                    st.error("AI 호출은 연결됐지만 API 결제/크레딧이 필요합니다. OpenAI Platform Billing에서 크레딧을 확인해 주세요.")
+                elif "OPENAI_API_KEY" in msg:
+                    st.error("Streamlit Secrets의 OPENAI_API_KEY를 확인해 주세요.")
+                else:
+                    st.error("AI 사진 분석 실패: " + msg[:500])
 
-    ocr_status = st.session_state.get("field_ocr_status", "")
-    if ocr_status:
-        st.caption("OCR 상태: " + ocr_status)
-    raw_ocr = st.session_state.get("field_ocr_raw", "")
-    if raw_ocr:
-        with st.expander("OCR 원문 확인"):
-            st.text(raw_ocr)
+    conf = int(st.session_state.get("field_ai_confidence", 0) or 0)
+    warns = st.session_state.get("field_ai_warnings", []) or []
+    color_v = st.session_state.get("field_ai_color", "")
+    if conf:
+        st.progress(min(max(conf, 0), 100), text=f"AI 인식 신뢰도 {conf}%")
+    if color_v:
+        st.caption("AI 인식 색상: " + str(color_v))
+    if warns:
+        st.warning("확인 필요: " + " / ".join(str(x) for x in warns))
 
-    st.markdown("### 자동 인식 결과 — 틀리면 바로 수정")
+    with st.expander("🔧 AI가 못 읽을 때 로컬 OCR 원문 확인"):
+        if st.button("OCR 보조 실행", key="field_ocr_fallback"):
+            text1, status1 = _ocr_text(img1)
+            text2, status2 = _ocr_text(img2)
+            st.session_state["field_ocr_raw"] = (text1 + "\n" + text2).strip()
+            st.session_state["field_ocr_status"] = f"① {status1} / ② {status2}"
+        if st.session_state.get("field_ocr_status"):
+            st.caption("OCR 상태: " + st.session_state["field_ocr_status"])
+        if st.session_state.get("field_ocr_raw"):
+            st.text(st.session_state["field_ocr_raw"])
+
+    st.markdown("### 자동 인식 결과 — 결제 전 반드시 한 번 확인")
     fc1, fc2 = st.columns(2)
     brand_v = fc1.text_input("브랜드", key="field_brand")
     model_v = fc2.text_input("모델/품번", key="field_model")
@@ -1118,8 +1245,20 @@ with tf:
     buy_v = pc1.number_input("현장 매입가(원)", min_value=0, max_value=10000000, step=500, key="field_buy_price")
     retail_v = pc2.number_input("정상가(원)", min_value=0, max_value=10000000, step=500, key="field_retail_price")
     disc_v = pc3.text_input("할인율(%)", key="field_discount")
-
     sizes_v = st.text_input("확인된 KR 사이즈", placeholder="예: 260, 265", key="field_sizes")
+
+    # sanity checks before saving
+    sanity = []
+    if buy_v and retail_v and buy_v > retail_v:
+        sanity.append("매입가가 정상가보다 큽니다.")
+    if model_v and len(str(model_v).strip()) < 5:
+        sanity.append("품번이 너무 짧아 보입니다.")
+    if not model_v:
+        sanity.append("품번 확인 필요")
+    if not buy_v:
+        sanity.append("매입가 확인 필요")
+    if sanity:
+        st.warning("결제 전 확인: " + " / ".join(sanity))
 
     s1, s2 = st.columns(2)
     if s1.button("💾 이 상품 저장", width="stretch", key="field_save_product"):
@@ -1140,14 +1279,14 @@ with tf:
         q1.link_button("POIZON 검색", f"https://kr.poizon.com/search?keyword={q_model}", width="stretch")
         q2.link_button("KREAM 검색", f"https://kream.co.kr/search?keyword={q_model}", width="stretch")
         q3.link_button("무신사 검색", f"https://www.musinsa.com/search/goods?keyword={q_model}", width="stretch")
-        st.caption("현재 V13은 사진 자동입력까지 구현했습니다. POIZON 완전자동 가격조회는 Open Platform API 키 연결 후 다음 단계에서 붙입니다.")
+        st.caption("V15는 사진에서 상품정보 자동입력까지 AI로 처리합니다. 플랫폼 가격·재고는 각 플랫폼의 최신값을 확인한 뒤 자동비교 탭에서 최종 판정합니다.")
 
     if s2.button("📲 촬영정보 텔레그램 전송", width="stretch", key="field_send_telegram"):
         if not q_model:
             st.error("먼저 모델/품번을 확인해 주세요.")
         else:
             msg = (
-                "📸 [현장 소싱 촬영]\n"
+                "📸 [현장 AI 소싱]\n"
                 f"브랜드: {brand_v or '-'}\n"
                 f"상품명: {name_v or '-'}\n"
                 f"모델/품번: {q_model}\n"
@@ -1155,7 +1294,8 @@ with tf:
                 f"정상가: {int(retail_v or 0):,}원\n"
                 f"할인율: {disc_v or '-'}%\n"
                 f"사이즈: {sizes_v or '-'}\n"
-                "→ POIZON/KREAM 가격 확인 후 최종 매입판정"
+                f"AI 신뢰도: {conf or '-'}%\n"
+                "→ POIZON/KREAM 최신 가격 확인 후 최종 매입판정"
             )
             ok, m = send_telegram_message(msg)
             (st.success if ok else st.error)(m)
