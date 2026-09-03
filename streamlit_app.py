@@ -6,7 +6,7 @@ import requests
 from PIL import Image, ImageOps, ImageEnhance
 import pytesseract
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V13 FIELD', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON 역소싱 V14 FIELD', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -856,104 +856,132 @@ def score_discovery(df):
 
 
 
-def _prepare_ocr_image(uploaded):
-    """Improve contrast for price tags / shoe-box labels before OCR."""
+def _prepare_ocr_images(uploaded):
+    """V14: return several OCR-friendly variants for price tags / box labels."""
     if uploaded is None:
-        return None
+        return []
+    try:
+        uploaded.seek(0)
+    except Exception:
+        pass
     img = Image.open(uploaded).convert("RGB")
-    # Keep enough detail, but avoid huge OCR payloads.
-    max_side = 1800
+    max_side = 2400
     if max(img.size) > max_side:
         ratio = max_side / max(img.size)
         img = img.resize((int(img.width * ratio), int(img.height * ratio)))
     gray = ImageOps.grayscale(img)
-    gray = ImageEnhance.Contrast(gray).enhance(1.8)
-    gray = ImageEnhance.Sharpness(gray).enhance(1.5)
-    return gray
+    contrast = ImageEnhance.Contrast(gray).enhance(2.2)
+    sharp = ImageEnhance.Sharpness(contrast).enhance(2.0)
+    # Hard threshold often helps small box-label/model-code text.
+    threshold = sharp.point(lambda x: 255 if x > 165 else 0)
+    return [gray, sharp, threshold]
+
 
 def _ocr_text(uploaded):
+    """V14: multi-pass OCR. Returns (best_text, diagnostic_message)."""
     if uploaded is None:
-        return ""
-    img = _prepare_ocr_image(uploaded)
-    try:
-        # English model codes + Korean price tags.
-        return pytesseract.image_to_string(img, lang="kor+eng", config="--psm 6")
-    except Exception:
-        try:
-            return pytesseract.image_to_string(img, lang="eng", config="--psm 6")
-        except Exception:
-            return ""
+        return "", "사진 없음"
+    variants = _prepare_ocr_images(uploaded)
+    if not variants:
+        return "", "이미지를 열 수 없음"
+
+    attempts = []
+    errors = []
+    # PSM 6: block, PSM 11: sparse label text.
+    for img in variants:
+        for lang in ("kor+eng", "eng"):
+            for psm in (6, 11):
+                try:
+                    txt = pytesseract.image_to_string(img, lang=lang, config=f"--oem 3 --psm {psm}")
+                    txt = str(txt or '').strip()
+                    if txt:
+                        # Reward useful retail patterns rather than random OCR noise.
+                        score = len(txt)
+                        score += 80 * len(re.findall(r"\b[A-Z]{1,4}\d{3,6}(?:-\d{2,4})?\b", txt.upper()))
+                        score += 35 * len(re.findall(r"(?:₩|KRW|원|\d{1,3}[,\s]\d{3})", txt, re.I))
+                        score += 25 * len(re.findall(r"\b(?:NIKE|ADIDAS|CROCS|ASICS|PUMA|SALOMON|NEPA)\b", txt.upper()))
+                        attempts.append((score, txt, lang, psm))
+                except Exception as e:
+                    errors.append(str(e))
+
+    if not attempts:
+        msg = errors[-1] if errors else "글자를 찾지 못했습니다"
+        return "", msg[:300]
+    attempts.sort(key=lambda x: x[0], reverse=True)
+    _, best, lang, psm = attempts[0]
+    return best, f"인식 성공 · {lang} · PSM {psm}"
+
 
 def _extract_product_fields(ocr_text):
-    """Best-effort extraction. User can correct every field before saving."""
+    """V14 conservative extraction: avoid filling fields from weak/random OCR."""
     raw = str(ocr_text or "")
     up = raw.upper()
 
-    # Model/style code candidates: HQ2197-600, DD1391-100, IE3677, KJ2123, etc.
-    candidates = re.findall(r"\b[A-Z]{1,4}\d{3,6}(?:-\d{2,4})?\b", up)
+    # Model/style code: require a mixed letter+digit code of useful length.
+    candidates = re.findall(r"(?<![A-Z0-9])[A-Z]{1,4}[\s-]?\d{3,6}(?:-\d{2,4})?(?![A-Z0-9])", up)
     model = ""
     for c in candidates:
-        if len(c) >= 6:
+        c = re.sub(r"\s+", "", c)
+        if 5 <= len(c) <= 14 and re.search(r"[A-Z]", c) and re.search(r"\d", c):
             model = c
             break
 
-    # Won prices; choose smallest plausible retail/discount price as likely buy price.
+    # Price: only accept stronger price forms (comma/원/KRW/₩), reducing random numbers.
     nums = []
-    for m in re.findall(r"(?:₩|W|KRW)?\s*([0-9]{1,3}(?:[,.\s][0-9]{3})+|[0-9]{5,7})\s*(?:원|KRW)?", raw, re.I):
-        v = re.sub(r"[^0-9]", "", m)
-        if v:
-            n = int(v)
-            if 10000 <= n <= 5000000:
-                nums.append(n)
+    price_patterns = [
+        r"(?:₩|KRW)\s*([0-9]{1,3}(?:[,\s][0-9]{3})+)",
+        r"([0-9]{1,3}(?:[,\s][0-9]{3})+)\s*원",
+        r"(?:SALE|PRICE|판매가|할인가|정상가)[^\d]{0,12}([0-9]{4,7})",
+    ]
+    for pat in price_patterns:
+        for m in re.findall(pat, raw, re.I):
+            v = re.sub(r"[^0-9]", "", str(m))
+            if v:
+                n = int(v)
+                if 10000 <= n <= 5000000:
+                    nums.append(n)
     nums = sorted(set(nums))
     buy_price = nums[0] if nums else 0
     retail_price = nums[-1] if len(nums) >= 2 else (nums[0] if nums else 0)
 
-    # Percent discount.
     discount = ""
-    dm = re.search(r"(\d{1,2})\s*%", raw)
-    if dm:
+    dm = re.search(r"(?<!\d)(\d{1,2})\s*%", raw)
+    if dm and 1 <= int(dm.group(1)) <= 90:
         discount = dm.group(1)
 
-    # Sizes in CM/mm.
     sizes = []
-    for m in re.findall(r"\b(?:CM\s*)?(2[2-9](?:\.5)?|3[0-2](?:\.5)?)\b", up):
+    # Prefer explicitly labelled CM/KR sizes.
+    for m in re.findall(r"(?:CM|KR|SIZE|사이즈)\s*[:：]?\s*(2[2-9](?:\.5)?|3[0-2](?:\.5)?|2[2-9]\d|3[0-2]\d)", up):
         try:
-            cm = float(m)
-            mm = int(round(cm * 10))
-            if 220 <= mm <= 325:
+            n = float(m)
+            mm = int(round(n * 10)) if n < 100 else int(n)
+            if 220 <= mm <= 325 and str(mm) not in sizes:
                 sizes.append(str(mm))
         except Exception:
             pass
-    for m in re.findall(r"\b(2[2-9]\d|3[0-2]\d)\b", up):
-        if m not in sizes:
-            sizes.append(m)
 
-    # Brand guess.
     brand = ""
-    for b in ["NIKE","ADIDAS","NEW BALANCE","PUMA","CROCS","ASICS","SALOMON","THE NORTH FACE","NEPA"]:
-        if b in up:
-            brand = b
+    brand_map = [
+        ("NEW BALANCE", ["NEW BALANCE", "NEWBALANCE"]),
+        ("THE NORTH FACE", ["THE NORTH FACE", "NORTH FACE"]),
+        ("NIKE", ["NIKE"]), ("ADIDAS", ["ADIDAS"]), ("PUMA", ["PUMA"]),
+        ("CROCS", ["CROCS"]), ("ASICS", ["ASICS"]), ("SALOMON", ["SALOMON"]), ("NEPA", ["NEPA"]),
+    ]
+    for canonical, aliases in brand_map:
+        if any(a in up for a in aliases):
+            brand = canonical
             break
 
-    # Product name heuristics: pick line containing well-known shoe name terms.
     lines = [re.sub(r"\s+", " ", x).strip() for x in raw.splitlines() if x.strip()]
     name = ""
-    keys = ["AIR MAX","AIR FORCE","DUNK","JORDAN","SAMBA","GAZELLE","ADIZERO","ULTRABOOST","CLIFTON","GEL-","XT-","2002R","530"]
+    keys = ["AIR MAX","AIR FORCE","DUNK","JORDAN","SAMBA","GAZELLE","ADIZERO","ULTRABOOST","CLIFTON","GEL-","XT-","2002R"]
     for ln in lines:
         if any(k in ln.upper() for k in keys):
-            name = ln
+            name = ln[:100]
             break
 
-    return {
-        "brand": brand,
-        "model": model,
-        "name": name,
-        "buy_price": buy_price,
-        "retail_price": retail_price,
-        "discount": discount,
-        "sizes": ", ".join(sizes[:12]),
-    }
+    return {"brand":brand,"model":model,"name":name,"buy_price":buy_price,
+            "retail_price":retail_price,"discount":discount,"sizes":", ".join(sizes[:12])}
 
 def send_telegram_message(text):
     """Send a Telegram message using Streamlit secrets via requests."""
@@ -1017,7 +1045,7 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V13 FIELD')
+st.title('KREAM · POIZON 역소싱 V14 FIELD')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -1036,7 +1064,7 @@ tf,t0,t1,t2,t3,t4,t5,t6=st.tabs(['📸 현장 카메라','🔥 POIZON 후보발�
 
 
 with tf:
-    st.subheader("📸 현장 카메라 판정 V13")
+    st.subheader("📸 현장 카메라 판정 V14")
     st.caption("가격표/상품 사진과 박스 라벨을 찍으면 품번·가격·사이즈를 1차 자동 인식합니다. 인식값은 반드시 확인·수정 후 저장하세요.")
     st.info("현장 권장: ① 가격표/상품 사진 1장 + ② 박스 라벨 1장. 같은 상품을 두 장 찍으면 인식률이 좋아집니다.")
 
@@ -1052,12 +1080,29 @@ with tf:
     img2 = photo_label or upload_label
 
     if st.button("🤖 사진 자동 인식", type="primary", width="stretch", key="field_ocr_button"):
-        combined = (_ocr_text(img1) + "\n" + _ocr_text(img2)).strip()
-        st.session_state["field_ocr_raw"] = combined
-        f = _extract_product_fields(combined)
-        for k, v in f.items():
-            st.session_state[f"field_{k}"] = v
+        if img1 is None and img2 is None:
+            st.warning("먼저 가격표 또는 박스 라벨 사진을 1장 이상 넣어주세요.")
+        else:
+            with st.spinner("사진 글자를 읽는 중입니다..."):
+                text1, status1 = _ocr_text(img1)
+                text2, status2 = _ocr_text(img2)
+                combined = (text1 + "\n" + text2).strip()
+                st.session_state["field_ocr_raw"] = combined
+                st.session_state["field_ocr_status"] = f"① {status1} / ② {status2}"
+                f = _extract_product_fields(combined)
+                for k, v in f.items():
+                    st.session_state[f"field_{k}"] = v
+            if combined:
+                if f.get("model") or f.get("buy_price") or f.get("brand"):
+                    st.success("사진 인식 완료. 아래 값이 맞는지 확인해 주세요.")
+                else:
+                    st.warning("글자는 읽었지만 품번/가격을 확실하게 찾지 못했습니다. 가격표와 박스 라벨을 가까이서 다시 찍어주세요.")
+            else:
+                st.error("사진에서 글자를 읽지 못했습니다. 아래 OCR 상태를 확인해 주세요.")
 
+    ocr_status = st.session_state.get("field_ocr_status", "")
+    if ocr_status:
+        st.caption("OCR 상태: " + ocr_status)
     raw_ocr = st.session_state.get("field_ocr_raw", "")
     if raw_ocr:
         with st.expander("OCR 원문 확인"):
