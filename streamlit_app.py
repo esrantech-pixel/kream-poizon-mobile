@@ -3,53 +3,48 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import requests
+from PIL import Image, ImageOps, ImageEnhance
+import pytesseract
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V12 MOBILE', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON 역소싱 V13 FIELD', layout='wide', initial_sidebar_state='collapsed')
 
-# ---- V12 MOBILE: optional access password + mobile layout ----
-def _mobile_check_password():
+# ---- V13 FIELD: mobile access protection + field layout ----
+def _check_app_password():
     try:
         expected = str(st.secrets.get("APP_PASSWORD", "")).strip()
     except Exception:
         expected = ""
-
-    # Local use can omit APP_PASSWORD. For public deployment, set it in Streamlit Secrets.
     if not expected:
         return True
-
-    if st.session_state.get("_app_password_ok", False):
+    if st.session_state.get("_field_auth_ok", False):
         return True
-
-    st.title("🔐 KREAM · POIZON 현장 소싱")
-    st.caption("외부 접속용 비밀번호를 입력하세요.")
-    entered = st.text_input("접속 비밀번호", type="password", key="_app_password_input")
+    st.title("🔐 현장 소싱 접속")
+    pwd = st.text_input("접속 비밀번호", type="password", key="_field_pwd")
     if st.button("접속", type="primary", width="stretch"):
-        if entered == expected:
-            st.session_state["_app_password_ok"] = True
+        if pwd == expected:
+            st.session_state["_field_auth_ok"] = True
             st.rerun()
         else:
             st.error("비밀번호가 맞지 않습니다.")
     return False
 
-if not _mobile_check_password():
+if not _check_app_password():
     st.stop()
 
 st.markdown("""
 <style>
-/* Mobile usability */
 @media (max-width: 768px) {
-    .block-container {padding-top: 1rem; padding-left: .7rem; padding-right: .7rem;}
-    h1 {font-size: 1.55rem !important;}
-    h2, h3 {font-size: 1.2rem !important;}
-    [data-testid="stDataFrame"] {font-size: .82rem;}
-    div[data-baseweb="tab-list"] {overflow-x: auto; white-space: nowrap;}
-    div[data-baseweb="tab"] {min-width: max-content;}
-    .stButton > button, .stDownloadButton > button {min-height: 46px;}
-    input, textarea {font-size: 16px !important;}
+  .block-container {padding-top: .7rem; padding-left: .6rem; padding-right: .6rem;}
+  h1 {font-size: 1.45rem !important;}
+  h2, h3 {font-size: 1.12rem !important;}
+  div[data-baseweb="tab-list"] {overflow-x:auto; white-space:nowrap;}
+  div[data-baseweb="tab"] {min-width:max-content;}
+  .stButton > button, .stDownloadButton > button {min-height:46px;}
+  input, textarea {font-size:16px !important;}
 }
 </style>
 """, unsafe_allow_html=True)
-# ---- end V12 MOBILE ----
+# ---- end V13 FIELD ----
 
 DATA_DIR = Path(__file__).parent / 'data'
 DATA_DIR.mkdir(exist_ok=True)
@@ -860,6 +855,106 @@ def score_discovery(df):
 
 
 
+
+def _prepare_ocr_image(uploaded):
+    """Improve contrast for price tags / shoe-box labels before OCR."""
+    if uploaded is None:
+        return None
+    img = Image.open(uploaded).convert("RGB")
+    # Keep enough detail, but avoid huge OCR payloads.
+    max_side = 1800
+    if max(img.size) > max_side:
+        ratio = max_side / max(img.size)
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+    gray = ImageOps.grayscale(img)
+    gray = ImageEnhance.Contrast(gray).enhance(1.8)
+    gray = ImageEnhance.Sharpness(gray).enhance(1.5)
+    return gray
+
+def _ocr_text(uploaded):
+    if uploaded is None:
+        return ""
+    img = _prepare_ocr_image(uploaded)
+    try:
+        # English model codes + Korean price tags.
+        return pytesseract.image_to_string(img, lang="kor+eng", config="--psm 6")
+    except Exception:
+        try:
+            return pytesseract.image_to_string(img, lang="eng", config="--psm 6")
+        except Exception:
+            return ""
+
+def _extract_product_fields(ocr_text):
+    """Best-effort extraction. User can correct every field before saving."""
+    raw = str(ocr_text or "")
+    up = raw.upper()
+
+    # Model/style code candidates: HQ2197-600, DD1391-100, IE3677, KJ2123, etc.
+    candidates = re.findall(r"\b[A-Z]{1,4}\d{3,6}(?:-\d{2,4})?\b", up)
+    model = ""
+    for c in candidates:
+        if len(c) >= 6:
+            model = c
+            break
+
+    # Won prices; choose smallest plausible retail/discount price as likely buy price.
+    nums = []
+    for m in re.findall(r"(?:₩|W|KRW)?\s*([0-9]{1,3}(?:[,.\s][0-9]{3})+|[0-9]{5,7})\s*(?:원|KRW)?", raw, re.I):
+        v = re.sub(r"[^0-9]", "", m)
+        if v:
+            n = int(v)
+            if 10000 <= n <= 5000000:
+                nums.append(n)
+    nums = sorted(set(nums))
+    buy_price = nums[0] if nums else 0
+    retail_price = nums[-1] if len(nums) >= 2 else (nums[0] if nums else 0)
+
+    # Percent discount.
+    discount = ""
+    dm = re.search(r"(\d{1,2})\s*%", raw)
+    if dm:
+        discount = dm.group(1)
+
+    # Sizes in CM/mm.
+    sizes = []
+    for m in re.findall(r"\b(?:CM\s*)?(2[2-9](?:\.5)?|3[0-2](?:\.5)?)\b", up):
+        try:
+            cm = float(m)
+            mm = int(round(cm * 10))
+            if 220 <= mm <= 325:
+                sizes.append(str(mm))
+        except Exception:
+            pass
+    for m in re.findall(r"\b(2[2-9]\d|3[0-2]\d)\b", up):
+        if m not in sizes:
+            sizes.append(m)
+
+    # Brand guess.
+    brand = ""
+    for b in ["NIKE","ADIDAS","NEW BALANCE","PUMA","CROCS","ASICS","SALOMON","THE NORTH FACE","NEPA"]:
+        if b in up:
+            brand = b
+            break
+
+    # Product name heuristics: pick line containing well-known shoe name terms.
+    lines = [re.sub(r"\s+", " ", x).strip() for x in raw.splitlines() if x.strip()]
+    name = ""
+    keys = ["AIR MAX","AIR FORCE","DUNK","JORDAN","SAMBA","GAZELLE","ADIZERO","ULTRABOOST","CLIFTON","GEL-","XT-","2002R","530"]
+    for ln in lines:
+        if any(k in ln.upper() for k in keys):
+            name = ln
+            break
+
+    return {
+        "brand": brand,
+        "model": model,
+        "name": name,
+        "buy_price": buy_price,
+        "retail_price": retail_price,
+        "discount": discount,
+        "sizes": ", ".join(sizes[:12]),
+    }
+
 def send_telegram_message(text):
     """Send a Telegram message using Streamlit secrets via requests."""
     try:
@@ -922,9 +1017,8 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V12 MOBILE')
+st.title('KREAM · POIZON 역소싱 V13 FIELD')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
-st.info('📱 V12 MOBILE: 아울렛·코스트코 등 외부 현장에서 휴대폰으로 접속해 바로 판정할 수 있습니다. 실제 결제 직전 가격·재고·수수료는 다시 확인하세요.')
 
 with st.sidebar:
     st.header('판정 기준')
@@ -938,7 +1032,89 @@ with st.sidebar:
     s['min_30d_sales']=st.number_input('추천 최소 30일 판매량',0,100000,int(s['min_30d_sales']),10)
     st.info('수수료는 실제 계정/카테고리에 따라 달라질 수 있습니다. 판매 확정 전 플랫폼 정산화면으로 최종 확인하세요.')
 
-t0,t1,t2,t3,t4,t5,t6=st.tabs(['🔥 POIZON 후보발굴','① 상품등록','② POIZON 가져오기','③ KREAM 가져오기','④ 자동 비교','⑤ 사용법','⑥ 오늘 살 것'])
+tf,t0,t1,t2,t3,t4,t5,t6=st.tabs(['📸 현장 카메라','🔥 POIZON 후보발굴','① 상품등록','② POIZON 가져오기','③ KREAM 가져오기','④ 자동 비교','⑤ 사용법','⑥ 오늘 살 것'])
+
+
+with tf:
+    st.subheader("📸 현장 카메라 판정 V13")
+    st.caption("가격표/상품 사진과 박스 라벨을 찍으면 품번·가격·사이즈를 1차 자동 인식합니다. 인식값은 반드시 확인·수정 후 저장하세요.")
+    st.info("현장 권장: ① 가격표/상품 사진 1장 + ② 박스 라벨 1장. 같은 상품을 두 장 찍으면 인식률이 좋아집니다.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        photo_price = st.camera_input("① 상품/가격표 촬영", key="field_photo_price")
+        upload_price = st.file_uploader("또는 가격표 사진 선택", type=["jpg","jpeg","png"], key="field_upload_price")
+    with c2:
+        photo_label = st.camera_input("② 박스 라벨 촬영", key="field_photo_label")
+        upload_label = st.file_uploader("또는 라벨 사진 선택", type=["jpg","jpeg","png"], key="field_upload_label")
+
+    img1 = photo_price or upload_price
+    img2 = photo_label or upload_label
+
+    if st.button("🤖 사진 자동 인식", type="primary", width="stretch", key="field_ocr_button"):
+        combined = (_ocr_text(img1) + "\n" + _ocr_text(img2)).strip()
+        st.session_state["field_ocr_raw"] = combined
+        f = _extract_product_fields(combined)
+        for k, v in f.items():
+            st.session_state[f"field_{k}"] = v
+
+    raw_ocr = st.session_state.get("field_ocr_raw", "")
+    if raw_ocr:
+        with st.expander("OCR 원문 확인"):
+            st.text(raw_ocr)
+
+    st.markdown("### 자동 인식 결과 — 틀리면 바로 수정")
+    fc1, fc2 = st.columns(2)
+    brand_v = fc1.text_input("브랜드", key="field_brand")
+    model_v = fc2.text_input("모델/품번", key="field_model")
+    name_v = st.text_input("상품명", key="field_name")
+
+    pc1, pc2, pc3 = st.columns(3)
+    buy_v = pc1.number_input("현장 매입가(원)", min_value=0, max_value=10000000, step=500, key="field_buy_price")
+    retail_v = pc2.number_input("정상가(원)", min_value=0, max_value=10000000, step=500, key="field_retail_price")
+    disc_v = pc3.text_input("할인율(%)", key="field_discount")
+
+    sizes_v = st.text_input("확인된 KR 사이즈", placeholder="예: 260, 265", key="field_sizes")
+
+    s1, s2 = st.columns(2)
+    if s1.button("💾 이 상품 저장", width="stretch", key="field_save_product"):
+        if not str(model_v).strip():
+            st.error("모델/품번을 확인해 주세요.")
+        elif int(buy_v or 0) <= 0:
+            st.error("실제 매입가를 확인해 주세요.")
+        else:
+            display_name = (str(brand_v).strip() + " " + str(name_v).strip()).strip()
+            upsert_product(str(model_v).strip(), int(buy_v), display_name)
+            st.session_state["pmodel"] = str(model_v).strip()
+            st.success(f"저장 완료: {model_v} / {int(buy_v):,}원")
+
+    q_model = str(model_v or "").strip()
+    if q_model:
+        st.markdown("### 현장 빠른 조회")
+        q1, q2, q3 = st.columns(3)
+        q1.link_button("POIZON 검색", f"https://kr.poizon.com/search?keyword={q_model}", width="stretch")
+        q2.link_button("KREAM 검색", f"https://kream.co.kr/search?keyword={q_model}", width="stretch")
+        q3.link_button("무신사 검색", f"https://www.musinsa.com/search/goods?keyword={q_model}", width="stretch")
+        st.caption("현재 V13은 사진 자동입력까지 구현했습니다. POIZON 완전자동 가격조회는 Open Platform API 키 연결 후 다음 단계에서 붙입니다.")
+
+    if s2.button("📲 촬영정보 텔레그램 전송", width="stretch", key="field_send_telegram"):
+        if not q_model:
+            st.error("먼저 모델/품번을 확인해 주세요.")
+        else:
+            msg = (
+                "📸 [현장 소싱 촬영]\n"
+                f"브랜드: {brand_v or '-'}\n"
+                f"상품명: {name_v or '-'}\n"
+                f"모델/품번: {q_model}\n"
+                f"매입가: {int(buy_v or 0):,}원\n"
+                f"정상가: {int(retail_v or 0):,}원\n"
+                f"할인율: {disc_v or '-'}%\n"
+                f"사이즈: {sizes_v or '-'}\n"
+                "→ POIZON/KREAM 가격 확인 후 최종 매입판정"
+            )
+            ok, m = send_telegram_message(msg)
+            (st.success if ok else st.error)(m)
+
 
 with t0:
     st.subheader('🔥 POIZON 역소싱 후보발굴 V11.0')
@@ -1179,7 +1355,7 @@ with t3:
         upsert_platform_cache(kream_df, KREAM_CACHE_PATH)
 
 with t4:
-    st.subheader('실전 소싱 판정 V11.2')
+    st.subheader('실전 소싱 판정 V13')
     # Always read the newest product cost table after tab changes.
     load_db.clear()
     base=load_db()
