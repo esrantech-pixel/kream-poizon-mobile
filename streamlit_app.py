@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.1 FIELD', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.2 ACTIVE MODEL', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -108,6 +108,65 @@ def upsert_product(model, buy_price=None, name=''):
         }
         db = pd.concat([db, pd.DataFrame([row])], ignore_index=True)
     save_db(db)
+
+
+def _clean_model(v):
+    s = str(v or '').strip()
+    return '' if s.lower() == 'nan' else s
+
+def set_active_model(model, clear_live_platform=True):
+    """Set the one product currently being investigated in the field."""
+    model = _clean_model(model)
+    if not model:
+        return
+    prev = _clean_model(st.session_state.get('_active_model', ''))
+    if clear_live_platform and prev and prev != model:
+        st.session_state['poizon_df'] = pd.DataFrame()
+        st.session_state['kream_df'] = pd.DataFrame()
+        st.session_state.pop('poizon_api_meta', None)
+        st.session_state.pop('poizon_api_raw', None)
+    st.session_state['_active_model'] = model
+
+def resolve_active_product(base, requested_model=''):
+    """Return one canonical product row plus KREAM/POIZON aliases."""
+    if base is None or len(base) == 0:
+        return pd.DataFrame(), '', '', ''
+    d = base.copy()
+    for c in ['model','kream_model','poizon_model']:
+        if c not in d.columns:
+            d[c] = ''
+        d[c] = d[c].astype(str).str.strip()
+
+    req = _clean_model(requested_model) or _clean_model(st.session_state.get('_active_model', ''))
+    if not req:
+        req = _clean_model(d.iloc[-1].get('model',''))
+
+    hit = d[
+        (d['model'] == req) |
+        (d['kream_model'] == req) |
+        (d['poizon_model'] == req)
+    ]
+    if len(hit) == 0:
+        return pd.DataFrame(), req, req, req
+
+    row = hit.iloc[[-1]].copy()
+    r = row.iloc[0]
+    canonical = _clean_model(r.get('model',''))
+    kalias = _clean_model(r.get('kream_model','')) or canonical
+    palias = _clean_model(r.get('poizon_model','')) or canonical
+    return row, canonical, kalias, palias
+
+def filter_platform_current(df, allowed_models):
+    """Keep only platform rows that belong to the active product."""
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) == 0:
+        return pd.DataFrame()
+    if 'model' not in df.columns:
+        return pd.DataFrame()
+    allowed = {_clean_model(x) for x in allowed_models if _clean_model(x)}
+    if not allowed:
+        return pd.DataFrame()
+    m = df['model'].astype(str).str.strip().isin(allowed)
+    return df.loc[m].copy().reset_index(drop=True)
 
 
 def won_to_num(x):
@@ -1538,8 +1597,8 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V17.1 FIELD')
-st.caption('Build: V17.1 · POIZON 공식 API + KREAM 휴대폰 빠른입력')
+st.title('KREAM · POIZON 역소싱 V17.2 ACTIVE MODEL')
+st.caption('Build: V17.2 · 현재 품번만 분리 비교 + POIZON 공식 API + KREAM 휴대폰 빠른입력')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -1655,9 +1714,11 @@ with tf:
             st.error("실제 매입가를 확인해 주세요.")
         else:
             display_name = (str(brand_v).strip() + " " + str(name_v).strip()).strip()
-            upsert_product(str(model_v).strip(), int(buy_v), display_name)
-            st.session_state["pmodel"] = str(model_v).strip()
-            st.success(f"저장 완료: {model_v} / {int(buy_v):,}원")
+            _saved_model = str(model_v).strip()
+            upsert_product(_saved_model, int(buy_v), display_name)
+            set_active_model(_saved_model, clear_live_platform=True)
+            st.session_state["pmodel"] = _saved_model
+            st.success(f"저장 완료: {model_v} / {int(buy_v):,}원 · 현재 조사 품번으로 설정")
 
     q_model = str(model_v or "").strip()
     if q_model:
@@ -1828,6 +1889,8 @@ with t2:
         if not str(pmodel).strip():
             st.warning('먼저 품번을 입력해주세요.')
         else:
+            set_active_model(str(pmodel).strip(), clear_live_platform=True)
+            st.session_state['poizon_df'] = pd.DataFrame()
             try:
                 with st.spinner('POIZON 공식 API에서 상품과 전 사이즈 데이터를 가져오는 중...'):
                     api_df, api_meta, api_raw = poizon_lookup_article_official(pmodel)
@@ -1846,7 +1909,10 @@ with t2:
 
                     st.success(f'성공! {len(api_df)}개 사이즈/SKU를 한 번에 가져왔습니다.')
                 else:
-                    st.warning('상품은 조회됐지만 사이즈별 통계 데이터가 없습니다.')
+                    st.session_state['poizon_df'] = pd.DataFrame()
+                    st.session_state['poizon_api_meta'] = api_meta
+                    st.session_state['poizon_api_raw'] = api_raw
+                    st.warning('상품은 조회됐지만 현재 품번의 사이즈별 통계 데이터가 없습니다. 이전 상품 데이터는 자동으로 제외했습니다.')
             except Exception as e:
                 st.error(f'POIZON 자동조회 실패: {e}')
                 st.info('키/서명/IP 허용 문제일 수 있습니다. 아래 “API 테스트 결과 JSON 붙여넣기”로도 같은 분석을 할 수 있습니다.')
@@ -1939,12 +2005,12 @@ with t2:
         upsert_product(pmodel, current_buy_price, _name_to_save)
 
 with t3:
-    st.subheader('③ KREAM 휴대폰 빠른입력 · V17.1')
-    st.success('V17.1: KREAM 서버 자동조회는 제거했습니다. 휴대폰 KREAM 앱에서 해당 사이즈의 “즉시 판매가”만 확인해 입력하면 자동 비교에 바로 반영됩니다.')
+    st.subheader('③ KREAM 휴대폰 빠른입력 · V17.2')
+    st.success('V17.2: 현재 조사 중인 품번만 분리해서 비교합니다. KREAM 서버 자동조회는 제거했습니다. 휴대폰 KREAM 앱에서 해당 사이즈의 “즉시 판매가”만 확인해 입력하면 자동 비교에 바로 반영됩니다.')
     st.caption('POIZON은 공식 API로 자동조회하고, KREAM은 차단에 강한 현장형 방식으로 사용합니다. 여러 사이즈를 확인할 때는 사이즈별로 한 번씩 저장하면 됩니다.')
 
     _base_for_kream = load_db()
-    _canonical_for_kream = str(st.session_state.get('pmodel', '')).strip()
+    _canonical_for_kream = _clean_model(st.session_state.get('_active_model', '')) or str(st.session_state.get('pmodel', '')).strip()
     _kream_default = _canonical_for_kream
     _kream_product_name = ''
     if len(_base_for_kream) and _canonical_for_kream:
@@ -1975,6 +2041,10 @@ with t3:
 
     # Candidate sizes: prefer POIZON official API rows already loaded for this model.
     _poizon_for_sizes=st.session_state.get('poizon_df', pd.DataFrame())
+    _poizon_for_sizes = filter_platform_current(
+        _poizon_for_sizes,
+        {_canonical_for_kream, _kream_default}
+    )
     _size_options=[]
     if isinstance(_poizon_for_sizes,pd.DataFrame) and len(_poizon_for_sizes) and 'size' in _poizon_for_sizes.columns:
         for _x in _poizon_for_sizes['size'].tolist():
@@ -2015,6 +2085,7 @@ with t3:
         elif int(_instant_sell or 0) <= 0:
             st.warning('KREAM 화면의 초록색 “즉시 판매가”를 입력해주세요.')
         else:
+            set_active_model(_canonical_for_kream or str(km).strip(), clear_live_platform=False)
             _row=pd.DataFrame([{
                 'platform':'KREAM',
                 'model':str(km).strip(),
@@ -2041,8 +2112,9 @@ with t3:
             st.success(f'저장 완료: {km} / KR {_sz} / KREAM 즉시판매 {int(_instant_sell):,}원')
 
     _kdf=st.session_state.get('kream_df',pd.DataFrame())
+    _kdf = filter_platform_current(_kdf, {_canonical_for_kream, _kream_default, str(km).strip()})
     if isinstance(_kdf,pd.DataFrame) and len(_kdf):
-        st.markdown('### 저장된 KREAM 사이즈')
+        st.markdown('### 현재 품번에 저장된 KREAM 사이즈')
         _showcols=[c for c in ['model','size','kream_price','kream_lowest_ask','kream_latest_price','kream_30d_sales'] if c in _kdf.columns]
         _show=_kdf[_showcols].rename(columns={
             'model':'모델','size':'KR사이즈','kream_price':'즉시판매가','kream_lowest_ask':'즉시구매가',
@@ -2081,27 +2153,37 @@ with t3:
 
 with t4:
     st.subheader('실전 소싱 판정 V13')
-    # Always read the newest product cost table after tab changes.
+    # V17.2 SAFETY: compare only the one product currently being investigated.
     load_db.clear()
-    base=load_db()
-    if len(base)==0:
+    _all_base=load_db()
+    if len(_all_base)==0:
         st.warning('① 상품등록 탭에서 모델/품번과 매입가를 먼저 등록해 주세요.')
     else:
+        _requested = _clean_model(st.session_state.get('_active_model','')) or _clean_model(st.session_state.get('pmodel',''))
+        base, _active_canonical, _active_kream, _active_poizon = resolve_active_product(_all_base, _requested)
+
+        if len(base) == 0:
+            st.error(f'현재 품번 {_requested or "-"}의 매입가/상품등록 정보를 찾지 못했습니다.')
+            st.stop()
+
         p=st.session_state.get('poizon_df',pd.DataFrame())
         k=st.session_state.get('kream_df',pd.DataFrame())
-        # 세션이 비어도 이전에 정상 인식해 저장한 플랫폼 자료를 자동 복원
-        if p is None or len(p) == 0: p = load_platform_cache(POIZON_CACHE_PATH)
-        if k is None or len(k) == 0: k = load_platform_cache(KREAM_CACHE_PATH)
+        if p is None or len(p) == 0:
+            p = load_platform_cache(POIZON_CACHE_PATH)
+        if k is None or len(k) == 0:
+            k = load_platform_cache(KREAM_CACHE_PATH)
 
-        # Helpful status: lets us immediately see whether all three sources survived tab changes.
-        _p_models = set(p['model'].astype(str).str.strip()) if p is not None and len(p) and 'model' in p.columns else set()
-        _k_models = set(k['model'].astype(str).str.strip()) if k is not None and len(k) and 'model' in k.columns else set()
-        _b_models = set(base['model'].astype(str).str.strip()) if len(base) else set()
-        st.caption(f'연결 상태 · 상품DB {len(base)}행 / POIZON {0 if p is None else len(p)}행 / KREAM {0 if k is None else len(k)}행')
-        _active_models = (_p_models | _k_models)
-        _missing_cost = sorted([m for m in _active_models if m and m not in _b_models])
-        if _missing_cost:
-            st.warning('매입가가 저장되지 않은 모델: ' + ', '.join(_missing_cost) + ' · ② POIZON 가져오기에서 실제 매입가를 입력해 주세요.')
+        p = filter_platform_current(p, {_active_canonical, _active_poizon})
+        k = filter_platform_current(k, {_active_canonical, _active_kream})
+
+        st.caption(
+            f'현재 조사 품번 {_active_canonical} · 상품DB 1행 / '
+            f'POIZON {len(p)}행 / KREAM {len(k)}행'
+        )
+        if len(p) == 0:
+            st.info('현재 품번의 POIZON 사이즈 데이터가 없습니다.')
+        if len(k) == 0:
+            st.info('현재 품번의 KREAM 저장 데이터가 없습니다.')
 
         result=compute_compare(base,k,p)
 
