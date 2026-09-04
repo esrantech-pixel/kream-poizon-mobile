@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V17 KREAM AUTO', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.1 FIELD', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -1538,7 +1538,8 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V16 OFFICIAL API')
+st.title('KREAM · POIZON 역소싱 V17.1 FIELD')
+st.caption('Build: V17.1 · POIZON 공식 API + KREAM 휴대폰 빠른입력')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -1938,9 +1939,9 @@ with t2:
         upsert_product(pmodel, current_buy_price, _name_to_save)
 
 with t3:
-    st.subheader('③ KREAM 자동조회 · V17')
-    st.success('V17: 품번으로 KREAM 상품을 찾고, 사이즈별 구매입찰(즉시판매 기준) · 판매입찰 · 최근 30일 체결을 자동으로 가져옵니다.')
-    st.caption('KREAM 공식 공개 개발자 API가 아닌 웹 조회 구조이므로 변경/차단 시 아래 수동 붙여넣기 백업을 사용합니다. 대량 반복조회는 하지 않습니다.')
+    st.subheader('③ KREAM 휴대폰 빠른입력 · V17.1')
+    st.success('V17.1: KREAM 서버 자동조회는 제거했습니다. 휴대폰 KREAM 앱에서 해당 사이즈의 “즉시 판매가”만 확인해 입력하면 자동 비교에 바로 반영됩니다.')
+    st.caption('POIZON은 공식 API로 자동조회하고, KREAM은 차단에 강한 현장형 방식으로 사용합니다. 여러 사이즈를 확인할 때는 사이즈별로 한 번씩 저장하면 됩니다.')
 
     _base_for_kream = load_db()
     _canonical_for_kream = str(st.session_state.get('pmodel', '')).strip()
@@ -1963,50 +1964,95 @@ with t3:
     elif 'kmodel' not in st.session_state:
         st.session_state['kmodel'] = _kream_default
 
-    km=st.text_input('KREAM 모델/품번',key='kmodel')
+    km=st.text_input('KREAM 모델/품번', key='kmodel')
     if _kream_product_name:
         st.caption(f'현재 상품: {_kream_product_name} · KREAM 모델명: {_kream_default}')
 
-    # Optional one-time fallback. For KI9388 test, known URL can be pasted if auto search SSR changes.
-    _manual_pid_text=st.text_input('KREAM 상품 URL 또는 Product ID (자동검색 실패할 때만)', placeholder='예: https://kream.co.kr/products/780287', key='kream_product_url_v17')
-    kream_df=pd.DataFrame()
+    if str(km).strip():
+        _search_url='https://kream.co.kr/search?keyword=' + urllib.parse.quote(str(km).strip())
+        st.link_button('📱 KREAM에서 이 품번 검색', _search_url, width='stretch')
+        st.info('휴대폰 KREAM 앱: 품번 검색 → 상품 선택 → 거래 및 입찰 내역 → 모든 옵션 → 사이즈 선택 → 화면 아래 초록색 “즉시 판매가” 확인')
 
-    if st.button('🚀 KREAM 자동조회', type='primary', width='stretch', key='kream_auto_lookup_v17'):
+    # Candidate sizes: prefer POIZON official API rows already loaded for this model.
+    _poizon_for_sizes=st.session_state.get('poizon_df', pd.DataFrame())
+    _size_options=[]
+    if isinstance(_poizon_for_sizes,pd.DataFrame) and len(_poizon_for_sizes) and 'size' in _poizon_for_sizes.columns:
+        for _x in _poizon_for_sizes['size'].tolist():
+            _s=str(_x).strip()
+            if _s and _s.lower()!='nan' and _s not in _size_options:
+                _size_options.append(_s)
+        def _sz_key(v):
+            try: return float(re.sub(r'[^0-9.]','',str(v)) or 99999)
+            except: return 99999
+        _size_options=sorted(_size_options,key=_sz_key)
+
+    _field_sizes_txt=str(st.session_state.get('field_sizes','') or '').strip()
+    if _field_sizes_txt:
+        for _s in re.findall(r'\d+(?:\.\d+)?',_field_sizes_txt):
+            if _s not in _size_options:
+                _size_options.append(_s)
+        _size_options=sorted(_size_options,key=lambda v: float(re.sub(r'[^0-9.]','',str(v)) or 99999))
+
+    st.markdown('### KREAM 사이즈 1개 빠른 입력')
+    c1,c2=st.columns(2)
+    if _size_options:
+        _ksize=c1.selectbox('KR 사이즈', _size_options, key='kream_quick_size')
+    else:
+        _ksize=c1.text_input('KR 사이즈', placeholder='예: 275', key='kream_quick_size_text')
+    _instant_sell=c2.number_input('즉시 판매가(원) — 초록색 가격', min_value=0, max_value=10000000, value=0, step=1000, key='kream_quick_sell')
+
+    c3,c4,c5=st.columns(3)
+    _instant_buy=c3.number_input('즉시 구매가(원) · 선택', min_value=0, max_value=10000000, value=0, step=1000, key='kream_quick_buy')
+    _latest_trade=c4.number_input('최근 체결가(원) · 선택', min_value=0, max_value=10000000, value=0, step=1000, key='kream_quick_latest')
+    _sales30=c5.number_input('최근 30일 체결수 · 선택', min_value=0, max_value=10000, value=0, step=1, key='kream_quick_sales30')
+
+    if st.button('💾 이 사이즈 KREAM 값 저장', type='primary', width='stretch', key='kream_quick_save'):
+        _sz=str(_ksize).strip()
         if not str(km).strip():
-            st.warning('먼저 KREAM 모델/품번을 입력해주세요.')
+            st.warning('먼저 모델/품번을 확인해주세요.')
+        elif not _sz:
+            st.warning('사이즈를 입력해주세요.')
+        elif int(_instant_sell or 0) <= 0:
+            st.warning('KREAM 화면의 초록색 “즉시 판매가”를 입력해주세요.')
         else:
-            try:
-                with st.spinner('KREAM 상품 매칭 → 입찰가 → 최근 체결을 확인하는 중...'):
-                    pid=_kream_product_id_from_text(_manual_pid_text)
-                    info={}
-                    if not pid:
-                        pid,info=kream_find_product_id(km)
-                    kream_df=kream_lookup_product(pid,km)
-                if len(kream_df):
-                    st.session_state['kream_df']=kream_df.copy()
-                    st.session_state['kream_product_id']=pid
-                    upsert_platform_cache(kream_df,KREAM_CACHE_PATH)
-                    st.success(f'성공! KREAM Product ID {pid} · {len(kream_df)}개 사이즈를 자동으로 가져왔습니다.')
-                else:
-                    st.warning('상품은 찾았지만 KREAM 시세 행을 가져오지 못했습니다. 아래 수동 백업을 사용해주세요.')
-            except Exception as e:
-                st.error(f'KREAM 자동조회 실패: {e}')
-                st.info('자동조회가 막혀도 아래 기존 복사→붙여넣기 방식은 그대로 사용할 수 있습니다.')
+            _row=pd.DataFrame([{
+                'platform':'KREAM',
+                'model':str(km).strip(),
+                'size':_sz,
+                'kream_price':float(_instant_sell),
+                'kream_highest_bid':float(_instant_sell),
+                'kream_lowest_ask':float(_instant_buy) if _instant_buy else None,
+                'kream_latest_price':float(_latest_trade) if _latest_trade else None,
+                'kream_recent_median':float(_latest_trade) if _latest_trade else None,
+                'kream_30d_sales':int(_sales30 or 0),
+                'kream_bid_qty':None,
+                'kream_ask_qty':None,
+            }])
+            _old=st.session_state.get('kream_df',pd.DataFrame())
+            if isinstance(_old,pd.DataFrame) and len(_old):
+                _old=_old.copy()
+                if 'model' in _old.columns and 'size' in _old.columns:
+                    _old=_old[~((_old['model'].astype(str).str.strip()==str(km).strip()) & (_old['size'].astype(str).str.strip()==_sz))]
+                _new=pd.concat([_old,_row],ignore_index=True,sort=False)
+            else:
+                _new=_row
+            st.session_state['kream_df']=_new.copy()
+            upsert_platform_cache(_new,KREAM_CACHE_PATH)
+            st.success(f'저장 완료: {km} / KR {_sz} / KREAM 즉시판매 {int(_instant_sell):,}원')
 
-    if 'kream_df' in st.session_state and isinstance(st.session_state['kream_df'],pd.DataFrame) and len(st.session_state['kream_df']):
-        kream_df=st.session_state['kream_df'].copy()
-
-    if len(kream_df):
-        _showcols=[c for c in ['size','kream_highest_bid','kream_lowest_ask','kream_latest_price','kream_recent_median','kream_30d_sales','kream_bid_qty','kream_ask_qty'] if c in kream_df.columns]
-        _show=kream_df[_showcols].rename(columns={
-            'size':'KR사이즈','kream_highest_bid':'최고 구매입찰(즉시판매 기준)','kream_lowest_ask':'최저 판매입찰',
-            'kream_latest_price':'최근 체결가','kream_recent_median':'30일 체결 중앙값','kream_30d_sales':'30일 체결수',
-            'kream_bid_qty':'구매입찰 수량','kream_ask_qty':'판매입찰 수량'})
+    _kdf=st.session_state.get('kream_df',pd.DataFrame())
+    if isinstance(_kdf,pd.DataFrame) and len(_kdf):
+        st.markdown('### 저장된 KREAM 사이즈')
+        _showcols=[c for c in ['model','size','kream_price','kream_lowest_ask','kream_latest_price','kream_30d_sales'] if c in _kdf.columns]
+        _show=_kdf[_showcols].rename(columns={
+            'model':'모델','size':'KR사이즈','kream_price':'즉시판매가','kream_lowest_ask':'즉시구매가',
+            'kream_latest_price':'최근체결가','kream_30d_sales':'30일체결수'})
         st.dataframe(_show,width='stretch')
-        _pid=str(st.session_state.get('kream_product_id','')).strip()
-        if _pid:
-            st.link_button('📱 KREAM 상품 직접 열기',f'https://kream.co.kr/products/{_pid}',width='stretch')
-        st.caption('자동 비교의 KREAM 판매 기준가는 “최고 구매입찰(즉시판매 기준)”을 사용합니다. 최근 체결가는 회전/참고용입니다.')
+        st.caption('자동 비교에서는 “즉시판매가”를 KREAM 판매 기준가로 사용합니다. 최근 체결이 오래됐거나 30일 체결수가 0이면 회전성은 보수적으로 보세요.')
+        if st.button('🧹 현재 KREAM 저장값 지우기', key='kream_quick_clear'):
+            st.session_state['kream_df']=pd.DataFrame()
+            st.success('현재 KREAM 저장값을 지웠습니다.')
+            st.rerun()
 
     with st.expander('🛟 백업: 기존 KREAM 복사→붙여넣기 / CSV'):
         upk=st.file_uploader('KREAM CSV/XLSX 업로드',type=['csv','xlsx','xls'],key='kr')
