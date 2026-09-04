@@ -1,4 +1,4 @@
-import io, re, webbrowser, math, json, urllib.request, urllib.parse
+import io, re, webbrowser, math, json, urllib.request, urllib.parse, hashlib, time
 from pathlib import Path
 import pandas as pd
 import streamlit as st
@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V15 AI', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON 역소싱 V16 OFFICIAL API', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -543,7 +543,7 @@ def compute_compare(base, kream=None, poizon=None):
         po_cols = [c for c in [
             'model','size','eu_size','sku_id','barcode',
             'poizon_avg_price','poizon_buyer_price',
-            'poizon_30d_sales','poizon_expected_profit'
+            'poizon_30d_sales','poizon_expected_profit','poizon_global_min_price','poizon_global_avg_price','poizon_global_30d_sales','poizon_local_30d_sales','poizon_local_avg_price','poizon_global_mom','poizon_local_mom','global_sku_id'
         ] if c in p.columns]
         p = p[po_cols]
 
@@ -858,6 +858,245 @@ def score_discovery(df):
 
 
 
+
+# ==================== V16 POIZON OFFICIAL API ====================
+
+POIZON_API_BASE = "https://open.poizon.com"
+POIZON_SKU_BY_ARTICLE = "/dop/api/v1/pop/api/v1/intl-commodity/intl/sku/sku-basic-info/by-article-number"
+POIZON_SKU_BY_SKU = "/dop/api/v1/pop/api/v1/intl-commodity/intl/sku/sku-basic-info/by-sku"
+
+def _poizon_secret(name, default=""):
+    try:
+        return str(st.secrets.get(name, default)).strip()
+    except Exception:
+        return str(default)
+
+def _poizon_sign_value(v):
+    """Official POP live-sign value normalization.
+    Lists are joined with commas; objects use compact JSON.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (list, tuple)):
+        return ",".join(_poizon_sign_value(x) for x in v)
+    if isinstance(v, dict):
+        return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+    return str(v)
+
+def _poizon_make_sign(payload, app_secret):
+    """POP live API: sort params -> key=URL-encoded(value) joined by & -> append secret -> MD5 uppercase."""
+    parts = []
+    for k in sorted(payload.keys()):
+        if k == "sign" or payload[k] is None:
+            continue
+        val = _poizon_sign_value(payload[k])
+        enc = urllib.parse.quote(val, safe="")
+        parts.append(f"{k}={enc}")
+    raw = "&".join(parts) + str(app_secret)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest().upper()
+
+def _poizon_post(path, business_payload, timeout=30):
+    app_key = _poizon_secret("POIZON_APP_KEY")
+    app_secret = _poizon_secret("POIZON_APP_SECRET")
+    access_token = _poizon_secret("POIZON_ACCESS_TOKEN")
+    if not app_key or not app_secret:
+        raise RuntimeError("Streamlit Secrets에 POIZON_APP_KEY와 POIZON_APP_SECRET을 먼저 넣어주세요.")
+
+    payload = {
+        "app_key": app_key,
+        "timestamp": int(time.time() * 1000),
+        "language": "en",
+        "timeZone": "Asia/Seoul",
+    }
+    if access_token:
+        payload["access_token"] = access_token
+    payload.update(business_payload or {})
+    payload["sign"] = _poizon_make_sign(payload, app_secret)
+
+    r = requests.post(
+        POIZON_API_BASE + path,
+        json=payload,
+        headers={"Content-Type": "application/json;charset=UTF-8"},
+        timeout=timeout,
+    )
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"POIZON 응답을 JSON으로 읽지 못했습니다. HTTP {r.status_code}: {r.text[:500]}")
+    if r.status_code >= 400:
+        raise RuntimeError(f"POIZON HTTP {r.status_code}: {data}")
+    if data.get("code") != 200 or data.get("success") is False:
+        raise RuntimeError(f"POIZON API 오류: {data.get('msg') or data}")
+    return data
+
+def _kr_size_from_sale_props(props):
+    for prop in props or []:
+        if str(prop.get("name","")).lower() == "size" or prop.get("sizeInfos"):
+            for s in prop.get("sizeInfos") or []:
+                if str(s.get("sizeKey","")).upper() == "KR":
+                    v = str(s.get("value") or s.get("defaultValue") or "").strip()
+                    if v:
+                        return v
+    return ""
+
+def _eu_size_from_sale_props(props):
+    for prop in props or []:
+        for s in prop.get("sizeInfos") or []:
+            if str(s.get("sizeKey","")).upper() in ("EU","FR"):
+                v = str(s.get("value") or s.get("defaultValue") or "").strip()
+                if v:
+                    return v
+    return ""
+
+def _money_amount(obj):
+    if not isinstance(obj, dict):
+        return None
+    x = obj.get("amount")
+    if x is None and isinstance(obj.get("money"), dict):
+        x = obj["money"].get("amount")
+    try:
+        return float(x) if x not in (None, "") else None
+    except Exception:
+        return None
+
+def _parse_poizon_api_response(api_json, model_hint=""):
+    """Parse by-article/by-sku official responses into the app's canonical POIZON rows."""
+    if not isinstance(api_json, dict):
+        return pd.DataFrame(), {}
+    data = api_json.get("data") or []
+    if isinstance(data, dict):
+        data = [data]
+
+    rows, meta = [], {}
+    for group in data:
+        if not isinstance(group, dict):
+            continue
+        spu = group.get("spuInfo") or {}
+        model = str(spu.get("articleNumber") or model_hint or "").strip().upper()
+        if spu and not meta:
+            meta = {
+                "model": model,
+                "name": str(spu.get("title") or "").strip(),
+                "brand": str(spu.get("brandName") or "").strip(),
+                "spuId": spu.get("spuId"),
+                "globalSpuId": spu.get("globalSpuId"),
+                "userCanBidding": spu.get("userCanBidding"),
+                "logoUrl": spu.get("logoUrl"),
+            }
+
+        sku_list = group.get("skuInfoList") or []
+        if not sku_list and group.get("skuId"):
+            sku_list = [group]
+
+        for sku in sku_list:
+            props = sku.get("regionSalePvInfoList") or []
+            kr = _kr_size_from_sale_props(props)
+            eu = _eu_size_from_sale_props(props)
+            sales = sku.get("commoditySales") or {}
+            minp = sku.get("minPrice") or {}
+            avgp = sku.get("averagePrice") or {}
+
+            global_min = _money_amount(minp.get("globalMinPrice") or minp.get("globalMinPriceVO") or {})
+            global_avg = _money_amount(avgp.get("globalAveragePrice") or avgp.get("globalAveragePriceVO") or {})
+            local_avg = _money_amount(avgp.get("localAveragePrice") or avgp.get("localAveragePriceVO") or {})
+
+            row = {
+                "model": model,
+                "size": kr or (f"EU {eu}" if eu else ""),
+                "eu_size": eu,
+                "sku_id": str(sku.get("skuId") or sku.get("dwSkuId") or ""),
+                "global_sku_id": str(sku.get("globalSkuId") or ""),
+                # Existing comparison engine fields:
+                "poizon_avg_price": global_avg,
+                "poizon_buyer_price": global_min,
+                "poizon_30d_sales": sales.get("globalSoldNum30"),
+                # Extra official API evidence:
+                "poizon_global_min_price": global_min,
+                "poizon_global_avg_price": global_avg,
+                "poizon_global_30d_sales": sales.get("globalSoldNum30"),
+                "poizon_local_30d_sales": sales.get("localSoldNum30"),
+                "poizon_local_avg_price": local_avg,
+                "poizon_global_mom": sales.get("globalMonthToMonthRatio"),
+                "poizon_local_mom": sales.get("localMonthToMonthRatio"),
+                "buy_status": sku.get("buyStatus"),
+                "user_has_bid": sku.get("userHasBid"),
+            }
+            if row["size"] or row["sku_id"]:
+                rows.append(row)
+
+    out = pd.DataFrame(rows)
+    if len(out):
+        for c in [
+            "poizon_avg_price","poizon_buyer_price","poizon_30d_sales",
+            "poizon_global_min_price","poizon_global_avg_price",
+            "poizon_global_30d_sales","poizon_local_30d_sales",
+            "poizon_local_avg_price","poizon_global_mom","poizon_local_mom"
+        ]:
+            if c in out.columns:
+                out[c] = pd.to_numeric(out[c], errors="coerce")
+        out = out.drop_duplicates(subset=[c for c in ["model","size","sku_id"] if c in out.columns], keep="last")
+    return out.reset_index(drop=True), meta
+
+def poizon_lookup_article_official(article_number):
+    """Article number -> all SKU IDs -> size-level official stats in one click."""
+    article = str(article_number or "").strip().upper()
+    if not article:
+        raise ValueError("품번을 입력해주세요.")
+
+    # Step 1: article -> SKU list
+    first = _poizon_post(POIZON_SKU_BY_ARTICLE, {
+        "articleNumber": article,
+        "region": "KR",
+        "sellerStatusEnable": False,
+        "buyStatusEnable": False,
+    })
+    first_df, meta = _parse_poizon_api_response(first, article)
+
+    sku_ids = []
+    for x in (first.get("data") or []):
+        if not isinstance(x, dict):
+            continue
+        for sku in x.get("skuInfoList") or []:
+            sid = sku.get("skuId") or sku.get("dwSkuId")
+            if sid is not None:
+                sku_ids.append(int(sid))
+    # Some article responses may already contain complete stats.
+    if not sku_ids and len(first_df):
+        return first_df, meta, first
+
+    # Step 2: query all size SKUs with sales + min/average price statistics.
+    frames, raw_batches = [], []
+    for i in range(0, len(sku_ids), 20):
+        batch = sku_ids[i:i+20]
+        detail = _poizon_post(POIZON_SKU_BY_SKU, {
+            "skuIds": batch,
+            "sellerStatusEnable": False,
+            "buyStatusEnable": False,
+            "statisticsDataQry": {
+                "salesEnable": True,
+                "minPriceEnable": True
+            },
+            "region": "KR",
+        })
+        raw_batches.append(detail)
+        ddf, dmeta = _parse_poizon_api_response(detail, article)
+        if not meta and dmeta:
+            meta = dmeta
+        if len(ddf):
+            frames.append(ddf)
+
+    if frames:
+        out = pd.concat(frames, ignore_index=True)
+        out = out.drop_duplicates(subset=["model","size","sku_id"], keep="last")
+    else:
+        out = first_df
+
+    return out.reset_index(drop=True), meta, {"article": first, "sku_batches": raw_batches}
+
+# ================== END V16 POIZON OFFICIAL API ==================
+
 def _prepare_ocr_images(uploaded):
     """V14: return several OCR-friendly variants for price tags / box labels."""
     if uploaded is None:
@@ -1152,7 +1391,7 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V15 AI')
+st.title('KREAM · POIZON 역소싱 V16 OFFICIAL API')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -1405,25 +1644,16 @@ with t1:
         c2.link_button('POIZON에서 검색',f'https://kr.poizon.com/search?keyword={model}',width='stretch')
 
 with t2:
-    st.subheader('POIZON 데이터')
-    st.write('가장 편한 방법 하나만 쓰면 됩니다: **파일 업로드** 또는 **판매자센터 표를 복사해서 붙여넣기**.')
-    poizon_df=pd.DataFrame()
-    up=st.file_uploader('POIZON CSV/XLSX 업로드',type=['csv','xlsx','xls'],key='pz')
-    if up:
-        try:
-            raw=pd.read_excel(up) if up.name.lower().endswith(('xlsx','xls')) else pd.read_csv(up)
-            poizon_df=normalize_import(raw,'POIZON')
-            st.dataframe(poizon_df,width='stretch')
-        except Exception as e: st.error(f'파일을 읽지 못했습니다: {e}')
-    st.markdown('**판매자센터에서 상품을 펼친 뒤 Ctrl+A → Ctrl+C → 아래에 Ctrl+V 하세요. V8은 EU 범위 사이즈 행도 자동 인식합니다.**')
+    st.subheader('② POIZON 공식 API 자동조회')
+    st.success('V16: 이제 품번만 입력하면 POIZON 공식 API에서 상품 → 전 사이즈 → 글로벌 최저가 → 글로벌 평균가 → 최근 30일 판매량을 자동으로 가져옵니다.')
+    st.caption('App Key / App Secret은 화면에 입력하지 않습니다. Streamlit Secrets에만 저장합니다.')
+
     _base_for_poizon = load_db()
-    _latest_model = str(_base_for_poizon.iloc[-1]['model']) if len(_base_for_poizon) else 'IE3677'
+    _latest_model = str(_base_for_poizon.iloc[-1]['model']) if len(_base_for_poizon) else 'HQ2197-600'
     if 'pmodel' not in st.session_state:
         st.session_state['pmodel'] = _latest_model
-    pmodel=st.text_input('이 붙여넣기의 모델/품번',key='pmodel')
+    pmodel = st.text_input('POIZON 품번 / 모델번호', key='pmodel')
 
-    # Keep the actual sourcing price with the current model. This avoids the old
-    # 'data shortage' result caused by a missing/stale product DB row.
     _existing_buy = 0
     _db_for_buy = load_db()
     if len(_db_for_buy) and str(pmodel).strip():
@@ -1435,42 +1665,130 @@ with t2:
         st.session_state[_buy_key] = _existing_buy
     current_buy_price = st.number_input(
         '이번 상품 실제 매입가(원)', min_value=0, max_value=10000000,
-        step=1000, key=_buy_key,
-        help='한 번 입력하면 상품 DB에 저장되어 KREAM/POIZON 자동 비교까지 유지됩니다.'
+        step=1000, key=_buy_key
     )
 
-    _pname = ''
-    if len(_base_for_poizon):
-        _hit = _base_for_poizon[_base_for_poizon['model'].astype(str) == str(pmodel)]
-        if len(_hit):
-            _pname = str(_hit.iloc[-1].get('name',''))
+    _has_poizon_key = bool(_poizon_secret("POIZON_APP_KEY"))
+    _has_poizon_secret = bool(_poizon_secret("POIZON_APP_SECRET"))
+    if _has_poizon_key and _has_poizon_secret:
+        st.caption('🔐 POIZON API 키 설정됨 · 비밀값은 표시하지 않습니다.')
+    else:
+        st.warning('POIZON_APP_KEY / POIZON_APP_SECRET이 아직 Streamlit Secrets에 없습니다. 아래 수동 JSON 방식은 바로 사용할 수 있습니다.')
 
-    if _pname:
-        st.caption(f'현재 상품: {_pname}')
-    if ('crocs' in _pname.lower()) or ('크록스' in _pname.lower()):
-        st.info('Crocs 상품은 POIZON의 EU 범위 사이즈(예: EU 36-37)를 KR mm로 자동 변환합니다.')
-
-    pasted=st.text_area('POIZON 표 붙여넣기',height=260,key='ppaste')
-    if pasted:
-        parsed=parse_poizon_paste(pasted,pmodel,_pname)
-        if len(parsed):
-            poizon_df=parsed
-            mapped = parsed[~parsed['size'].astype(str).str.startswith('EU ')].shape[0] if 'size' in parsed.columns else 0
-            st.success(f'{len(parsed)}개 POIZON 사이즈 행을 인식했습니다. KR 매칭 가능 {mapped}개')
-            st.dataframe(parsed,width='stretch')
-            if 'size' in parsed.columns and parsed['size'].astype(str).str.startswith('EU ').any():
-                st.warning('일부 EU 사이즈는 KR mm로 자동 변환하지 못했습니다. 이 행은 KREAM과 자동 매칭되지 않습니다.')
+    poizon_df = pd.DataFrame()
+    if st.button('🚀 POIZON 공식 API 자동조회', type='primary', width='stretch', key='poizon_official_lookup'):
+        if not str(pmodel).strip():
+            st.warning('먼저 품번을 입력해주세요.')
         else:
-            st.warning('POIZON 사이즈 행을 인식하지 못했습니다. 상품을 펼친 상태에서 Ctrl+A → Ctrl+C 후 다시 붙여넣어 주세요.')
+            try:
+                with st.spinner('POIZON 공식 API에서 상품과 전 사이즈 데이터를 가져오는 중...'):
+                    api_df, api_meta, api_raw = poizon_lookup_article_official(pmodel)
+                if len(api_df):
+                    poizon_df = api_df.copy()
+                    st.session_state['poizon_df'] = api_df.copy()
+                    st.session_state['poizon_api_meta'] = api_meta
+                    st.session_state['poizon_api_raw'] = api_raw
+
+                    name = str(api_meta.get('name') or '').strip()
+                    if name:
+                        upsert_product(pmodel, current_buy_price if current_buy_price > 0 else None, name)
+                    else:
+                        upsert_product(pmodel, current_buy_price if current_buy_price > 0 else None, '')
+                    upsert_platform_cache(api_df, POIZON_CACHE_PATH)
+
+                    st.success(f'성공! {len(api_df)}개 사이즈/SKU를 한 번에 가져왔습니다.')
+                else:
+                    st.warning('상품은 조회됐지만 사이즈별 통계 데이터가 없습니다.')
+            except Exception as e:
+                st.error(f'POIZON 자동조회 실패: {e}')
+                st.info('키/서명/IP 허용 문제일 수 있습니다. 아래 “API 테스트 결과 JSON 붙여넣기”로도 같은 분석을 할 수 있습니다.')
+
+    # Show cached/current official API result.
+    if 'poizon_df' in st.session_state and isinstance(st.session_state['poizon_df'], pd.DataFrame) and len(st.session_state['poizon_df']):
+        poizon_df = st.session_state['poizon_df'].copy()
+
     if len(poizon_df):
-        # Persist BOTH platform data and sourcing cost before leaving this tab.
-        upsert_product(pmodel, current_buy_price if current_buy_price > 0 else None, _pname)
-        st.session_state['poizon_df']=poizon_df.copy()
-        upsert_platform_cache(poizon_df, POIZON_CACHE_PATH)
-        st.download_button('POIZON 정리본 CSV 저장',poizon_df.to_csv(index=False).encode('utf-8-sig'),'poizon_clean.csv','text/csv')
-    elif str(pmodel).strip() and current_buy_price > 0:
-        # Save cost immediately even before POIZON parsing succeeds.
-        upsert_product(pmodel, current_buy_price, _pname)
+        meta = st.session_state.get('poizon_api_meta', {})
+        if meta:
+            st.markdown(f"**{meta.get('brand','')} · {meta.get('name','')}**")
+            st.caption(f"품번 {meta.get('model', pmodel)} · SPU {meta.get('spuId','-')} · Global SPU {meta.get('globalSpuId','-')}")
+        show_cols = [c for c in [
+            'size','eu_size','sku_id',
+            'poizon_global_min_price','poizon_global_avg_price',
+            'poizon_global_30d_sales','poizon_local_30d_sales',
+            'poizon_global_mom'
+        ] if c in poizon_df.columns]
+        show = poizon_df[show_cols].copy()
+        rename = {
+            'size':'KR사이즈','eu_size':'EU사이즈','sku_id':'POIZON SKU',
+            'poizon_global_min_price':'글로벌 최저가',
+            'poizon_global_avg_price':'글로벌 평균가',
+            'poizon_global_30d_sales':'글로벌 30일 판매',
+            'poizon_local_30d_sales':'KR 30일 판매',
+            'poizon_global_mom':'글로벌 전월비'
+        }
+        st.dataframe(show.rename(columns=rename), width='stretch')
+        st.download_button(
+            'POIZON 공식 API 결과 CSV 저장',
+            poizon_df.to_csv(index=False).encode('utf-8-sig'),
+            f'poizon_{str(pmodel).strip()}_official.csv',
+            'text/csv'
+        )
+
+    with st.expander('🧪 API 테스트 결과 JSON 붙여넣기 (자동조회가 막힐 때)'):
+        st.caption('POIZON API Testing tool의 Response 전체를 그대로 붙여넣으면 됩니다. App Secret은 붙여넣지 마세요.')
+        api_paste = st.text_area('POIZON Response JSON', height=260, key='poizon_api_json_paste')
+        if st.button('JSON 분석해서 저장', key='parse_poizon_api_json'):
+            try:
+                obj = json.loads(api_paste)
+                parsed_api, parsed_meta = _parse_poizon_api_response(obj, pmodel)
+                if len(parsed_api):
+                    st.session_state['poizon_df'] = parsed_api.copy()
+                    st.session_state['poizon_api_meta'] = parsed_meta
+                    upsert_platform_cache(parsed_api, POIZON_CACHE_PATH)
+                    if parsed_meta.get('name'):
+                        upsert_product(pmodel, current_buy_price if current_buy_price > 0 else None, parsed_meta.get('name'))
+                    st.success(f'{len(parsed_api)}개 SKU 데이터를 읽었습니다.')
+                    st.dataframe(parsed_api, width='stretch')
+                else:
+                    st.warning('이 JSON에서 SKU 데이터를 찾지 못했습니다.')
+            except Exception as e:
+                st.error(f'JSON 분석 실패: {e}')
+
+    with st.expander('📋 기존 방식: CSV/XLSX 또는 판매자센터 복사 붙여넣기'):
+        manual_df = pd.DataFrame()
+        up = st.file_uploader('POIZON CSV/XLSX 업로드', type=['csv','xlsx','xls'], key='pz')
+        if up:
+            try:
+                raw = pd.read_excel(up) if up.name.lower().endswith(('xlsx','xls')) else pd.read_csv(up)
+                manual_df = normalize_import(raw,'POIZON')
+                st.dataframe(manual_df,width='stretch')
+            except Exception as e:
+                st.error(f'파일을 읽지 못했습니다: {e}')
+
+        _pname = ''
+        if len(_base_for_poizon):
+            _hit = _base_for_poizon[_base_for_poizon['model'].astype(str) == str(pmodel)]
+            if len(_hit):
+                _pname = str(_hit.iloc[-1].get('name',''))
+
+        pasted = st.text_area('판매자센터 표 붙여넣기', height=220, key='ppaste')
+        if pasted:
+            parsed = parse_poizon_paste(pasted,pmodel,_pname)
+            if len(parsed):
+                manual_df = parsed
+                st.success(f'{len(parsed)}개 POIZON 사이즈 행을 인식했습니다.')
+                st.dataframe(parsed,width='stretch')
+            else:
+                st.warning('POIZON 사이즈 행을 인식하지 못했습니다.')
+
+        if len(manual_df):
+            st.session_state['poizon_df'] = manual_df.copy()
+            upsert_platform_cache(manual_df, POIZON_CACHE_PATH)
+
+    if str(pmodel).strip() and current_buy_price > 0:
+        _name_to_save = str(st.session_state.get('poizon_api_meta', {}).get('name') or '')
+        upsert_product(pmodel, current_buy_price, _name_to_save)
 
 with t3:
     st.subheader('KREAM 데이터')
@@ -1796,7 +2114,7 @@ with t4:
             order=[
                 'model','name','size','eu_size','sku_id','buy_price_num','권장최대매입가','추천구매수량','매입가이드',
                 'kream_price','kream_30d_sales','kream_latest_price','kream_profit','kream_roi',
-                'poizon_avg_price','poizon_buyer_price','poizon_30d_sales','poizon_expected_profit','poizon_profit','poizon_roi',
+                'poizon_avg_price','poizon_buyer_price','poizon_30d_sales','poizon_expected_profit','poizon_global_min_price','poizon_global_avg_price','poizon_global_30d_sales','poizon_local_30d_sales','poizon_local_avg_price','poizon_global_mom','poizon_local_mom','global_sku_id','poizon_profit','poizon_roi',
                 'best_platform','best_profit','best_roi','best_30d_sales','판정','판정이유'
             ]
             show=[c for c in order if c in result.columns]
