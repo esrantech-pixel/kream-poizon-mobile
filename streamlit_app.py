@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.0', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.8', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -2376,14 +2376,25 @@ with tl:
                     _cols=[c for c in ['size','eu_size','sku_id','poizon_global_min_price','poizon_global_avg_price','poizon_30d_sales'] if c in _pdf.columns]
                     st.dataframe(_pdf[_cols].head(20),width='stretch',hide_index=True)
 
-                    # V18.7: POIZON official API alone can now produce a provisional field buying decision.
+                    # V18.8: only POIZON rows with a real 30d sale and a usable market price are valid for profit judgement.
                     # KREAM remains the second-market cross-check, not a prerequisite for the first decision.
                     _base_all=load_db()
                     _base_one=_base_all[_base_all['model'].astype(str).str.strip()==str(_ready).strip()].copy()
+                    # V18.8 SAFETY: a POIZON price is valid only when the same SKU/size has actual 30-day sales.
+                    # This prevents placeholder/high fallback prices (e.g. 232,000 with 0/None sales) from creating fake profit.
+                    _pdf_judge=_pdf.copy()
+                    if 'poizon_30d_sales' in _pdf_judge.columns:
+                        _sales_num=pd.to_numeric(_pdf_judge['poizon_30d_sales'], errors='coerce')
+                    else:
+                        _sales_num=pd.Series([None]*len(_pdf_judge), index=_pdf_judge.index)
+                    _valid_sales=_sales_num.fillna(0)>0
+                    for _pc in ['poizon_buyer_price','poizon_avg_price']:
+                        if _pc in _pdf_judge.columns:
+                            _pdf_judge.loc[~_valid_sales,_pc]=None
                     if len(_base_one):
-                        _cmp=compute_compare(_base_one,kream=None,poizon=_pdf.copy())
+                        _cmp=compute_compare(_base_one,kream=None,poizon=_pdf_judge.copy())
                         if isinstance(_cmp,pd.DataFrame) and len(_cmp):
-                            st.markdown('##### 🎯 V18.7 POIZON 즉시 매입판정')
+                            st.markdown('##### 🎯 V18.8 POIZON 유효가격 매입판정')
                             st.caption('롯데 매입가와 POIZON 공식 가격·30일 판매량만으로 1차 판정합니다. KREAM은 다음 단계에서 교차검증합니다.')
                             _rows=[]
                             for _,_r in _cmp.iterrows():
@@ -2429,8 +2440,62 @@ with tl:
                                 _b=_actionable.iloc[0]
                                 st.success(f"🏆 1순위: KR {_b['사이즈']} · {_b['판정']} · 예상 순익 {float(_b['예상 순이익']):,.0f}원 · ROI {float(_b['ROI(%)']):.1f}% · 30일 {int(float(_b['30일 판매'])) if pd.notna(_b['30일 판매']) else 0}건")
                             else:
-                                st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 가격이 더 내려가거나 판매가가 올라갈 때 다시 확인하세요.')
-                    st.caption('다음은 ③ KREAM 가져오기에서 같은 사이즈의 즉시판매가를 넣어 POIZON 판정을 교차검증하면 됩니다.')
+                                st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 판매량 없는 POIZON 가격은 수익 계산에서 제외했습니다.')
+
+                    st.markdown('##### 🔁 V18.8 KREAM 자동 교차검증')
+                    st.caption('같은 품번을 KREAM에서 자동 매칭해 즉시판매가(최고 매입입찰)·30일 체결을 가져오고 POIZON과 같은 사이즈로 비교합니다.')
+                    if st.button('🔎 KREAM 자동조회 + POIZON 교차비교', type='primary', width='stretch', key='lotte_v188_kream_auto'):
+                        try:
+                            _pid,_kinfo=kream_find_product_id(_ready)
+                            _kauto=kream_lookup_product(_pid, model=_ready)
+                            if _kauto is None or len(_kauto)==0:
+                                raise RuntimeError('KREAM에서 사이즈별 입찰/거래 데이터를 가져오지 못했습니다.')
+                            st.session_state['kream_df']=_kauto.copy()
+                            upsert_platform_cache(_kauto,KREAM_CACHE_PATH)
+                            st.session_state['_lotte_v188_kream_pid']=_pid
+                            st.success(f'KREAM 자동연결 성공 · 상품ID {_pid} · {len(_kauto)}개 사이즈')
+                        except Exception as e:
+                            st.error(f'KREAM 자동조회 실패: {e}')
+                            st.info('이 경우 ③ KREAM 가져오기 탭에서 상품 URL/ID 또는 즉시판매가를 한 번만 입력하면 교차비교를 계속할 수 있습니다.')
+
+                    _kauto_now=filter_platform_current(st.session_state.get('kream_df',pd.DataFrame()), {_ready})
+                    if isinstance(_kauto_now,pd.DataFrame) and len(_kauto_now) and len(_base_one):
+                        _cross=compute_compare(_base_one,kream=_kauto_now.copy(),poizon=_pdf_judge.copy())
+                        if isinstance(_cross,pd.DataFrame) and len(_cross):
+                            _show=[]
+                            for _,_r in _cross.iterrows():
+                                _show.append({
+                                    '사이즈':str(_r.get('size','')),
+                                    'POIZON 유효가':_r.get('poizon_buyer_price'),
+                                    'POIZON 30일':_r.get('poizon_30d_sales'),
+                                    'KREAM 즉시판매':_r.get('kream_price'),
+                                    'KREAM 30일':_r.get('kream_30d_sales'),
+                                    '추천 판매처':_r.get('best_platform'),
+                                    '예상 순이익':_r.get('best_profit'),
+                                    'ROI(%)':_r.get('best_roi'),
+                                    '최종판정':_r.get('판정'),
+                                    '추천수량':_r.get('추천구매수량'),
+                                    '판정이유':_r.get('판정이유'),
+                                })
+                            _cross_show=pd.DataFrame(_show)
+                            _order={'🟢🟢 강력매입':0,'🟢 매입추천':1,'🟠 1개 테스트':2,'🟡 관찰':3,'🔴 PASS':4,'⚪ 데이터부족':5}
+                            _cross_show['_rank']=_cross_show['최종판정'].map(_order).fillna(9)
+                            _cross_show=_cross_show.sort_values(['_rank','예상 순이익'],ascending=[True,False],na_position='last').drop(columns=['_rank'])
+                            st.dataframe(_cross_show,width='stretch',hide_index=True,column_config={
+                                'POIZON 유효가':st.column_config.NumberColumn(format='%,d원'),
+                                'KREAM 즉시판매':st.column_config.NumberColumn(format='%,d원'),
+                                '예상 순이익':st.column_config.NumberColumn(format='%,d원'),
+                                'ROI(%)':st.column_config.NumberColumn(format='%.1f%%'),
+                                'POIZON 30일':st.column_config.NumberColumn(format='%d건'),
+                                'KREAM 30일':st.column_config.NumberColumn(format='%d건'),
+                            })
+                            _final=_cross_show[_cross_show['최종판정'].isin(['🟢🟢 강력매입','🟢 매입추천','🟠 1개 테스트'])]
+                            if len(_final):
+                                _z=_final.iloc[0]
+                                st.success(f"🏆 최종 1순위: KR {_z['사이즈']} · {_z['최종판정']} · 판매처 {_z['추천 판매처']} · 예상 순익 {float(_z['예상 순이익']):,.0f}원 · ROI {float(_z['ROI(%)']):.1f}%")
+                            else:
+                                st.warning('POIZON+KREAM 교차검증 기준에서도 현재 매입 추천 사이즈가 없습니다.')
+                    st.caption('KREAM 자동조회가 막히면 ③ KREAM 가져오기 탭의 수동 입력을 백업으로 사용합니다.')
 
         a1,a2=st.columns(2)
         if a1.button('➕ 선택상품을 우리 비교목록에 넣기',width='stretch',key='lotte_add_selected'):
