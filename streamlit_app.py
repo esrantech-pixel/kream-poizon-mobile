@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.6 SAFETY MARGIN', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.6.1 SAFETY MARGIN FIX', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -1791,7 +1791,21 @@ def field_decision_telegram_text(df, product_name='', model=''):
             f"🔄 30일 판매: {txt(best,'추천처30일판매')}개",
             f"👉 추천 수량: {txt(best,'추천구매수량','0')}개",
             f"🚨 최대 매입가: {won(best,'권장최대매입가')}",
-            f"🛡 매입가 안전여유: {won(best,'매입안전여유')}",
+        ]
+
+        # V17.6.1: 안전여유 실제 숫자 + 부족/충족 상태를 명확히 표시
+        _margin_v = best.get('매입안전여유')
+        _safe_margin_req = float(st.session_state.settings.get('safe_buy_margin', 10000))
+        if _margin_v is not None and pd.notna(_margin_v):
+            _margin_status = '✅ 충족' if float(_margin_v) >= _safe_margin_req else '⚠️ 부족'
+            lines.append(
+                f"🛡 매입가 안전여유: {money(_margin_v)} {_margin_status} "
+                f"(기준 {money(_safe_margin_req)})"
+            )
+        else:
+            lines.append("🛡 매입가 안전여유: 확인 필요")
+
+        lines += [
         ]
 
         others = actionable.iloc[1:7]
@@ -1837,8 +1851,8 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V17.6 SAFETY MARGIN')
-st.caption('Build: V17.6 · 실제 순이익 + 안전마진 판정 + 텔레그램 현장 경고 + POIZON 기본 수수료 10%')
+st.title('KREAM · POIZON 역소싱 V17.6.1 SAFETY MARGIN FIX')
+st.caption('Build: V17.6.1 · 안전여유 텔레그램 표시 수정 + 실제 순이익 + 안전마진 판정')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2460,7 +2474,7 @@ with t4:
 
         compact_cols=[
             '판정','판정이유','매입가이드','추천구매수량','model','size','eu_size','sku_id',
-            'buy_price_num','권장최대매입가',
+            'buy_price_num','권장최대매입가','매입안전여유',
             'best_platform','best_profit','best_roi','best_30d_sales',
             'kream_price','kream_30d_sales','kream_fee_amount','kream_fixed_cost',
             'poizon_avg_price','poizon_buyer_price','poizon_30d_sales',
@@ -2543,7 +2557,7 @@ with t4:
                 _product_name = str(_meta_name).strip()
         if not _product_name:
             _product_name = f'품번 {_active_canonical}'
-        if st.button('📲 현장판정 텔레그램 전송', type='primary', width='stretch', key='telegram_field_decision_v176'):
+        if st.button('📲 현장판정 텔레그램 전송', type='primary', width='stretch', key='telegram_field_decision_v1761'):
             _tg_text = field_decision_telegram_text(compact, _product_name, _active_canonical)
             ok, msg = send_telegram_message(_tg_text)
             (st.success if ok else st.error)(msg)
