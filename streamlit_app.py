@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.6.1 SAFETY MARGIN FIX', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.0', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -54,19 +54,15 @@ DB_PATH = DATA_DIR / 'products.csv'
 KREAM_CACHE_PATH = DATA_DIR / 'kream_latest.csv'
 POIZON_CACHE_PATH = DATA_DIR / 'poizon_latest.csv'
 DISCOVERY_PATH = DATA_DIR / 'poizon_discovery.csv'
+LOTTEON_PATH = DATA_DIR / 'lotteon_sourcing.csv'
 
 DEFAULT_SETTINGS = {
     'kream_fee_rate': 0.035,
-    'poizon_fee_rate': 0.10,
+    'poizon_fee_rate': 0.05,
     'shipping_cost': 7000,
     'packing_cost': 1000,
-    'kream_fixed_cost': 0,
-    'poizon_fixed_cost': 0,
-    'other_cost': 0,  # 관세/검수/추가운영비 등 사용자가 직접 입력
     'target_profit': 15000,
     'target_roi': 20.0,
-    'safe_buy_roi': 25.0,
-    'safe_buy_margin': 10000,
     'min_30d_sales': 2,
 }
 
@@ -618,37 +614,20 @@ def compute_compare(base, kream=None, poizon=None):
     s = st.session_state.settings
 
     if 'kream_price' in df.columns:
-        df['kream_fee_amount'] = df['kream_price'] * s['kream_fee_rate']
-        df['kream_fixed_cost'] = float(s.get('kream_fixed_cost', 0))
-        df['kream_net'] = (
-            df['kream_price']
-            - df['kream_fee_amount']
-            - df['kream_fixed_cost']
-            - s['shipping_cost']
-            - s['packing_cost']
-            - s.get('other_cost', 0)
-        )
+        df['kream_net'] = df['kream_price']*(1-s['kream_fee_rate']) - s['shipping_cost'] - s['packing_cost']
         df['kream_profit'] = df['kream_net'] - df['buy_price_num']
         df['kream_roi'] = df['kream_profit']/df['buy_price_num']*100
 
     if 'poizon_buyer_price' in df.columns:
-        raw_payout = df.get('poizon_expected_profit')
-        if raw_payout is None:
-            raw_payout = pd.Series([None] * len(df), index=df.index, dtype='float64')
-        estimated_payout = (
-            df['poizon_buyer_price'] * (1 - s['poizon_fee_rate'])
-            - float(s.get('poizon_fixed_cost', 0))
-        )
-        payout = raw_payout.where(raw_payout.notna(), estimated_payout)
-        df['poizon_payout_used'] = payout
-        df['poizon_fee_amount'] = (df['poizon_buyer_price'] - payout).clip(lower=0)
-        df['poizon_fixed_cost'] = float(s.get('poizon_fixed_cost', 0))
-        df['poizon_net'] = (
-            payout
-            - s['shipping_cost']
-            - s['packing_cost']
-            - s.get('other_cost', 0)
-        )
+        payout = df.get('poizon_expected_profit')
+        if payout is None:
+            payout = df['poizon_buyer_price']*(1-s['poizon_fee_rate'])
+        else:
+            payout = payout.where(
+                payout.notna(),
+                df['poizon_buyer_price']*(1-s['poizon_fee_rate'])
+            )
+        df['poizon_net'] = payout - s['shipping_cost'] - s['packing_cost']
         df['poizon_profit'] = df['poizon_net'] - df['buy_price_num']
         df['poizon_roi'] = df['poizon_profit']/df['buy_price_num']*100
 
@@ -780,31 +759,21 @@ def compute_compare(base, kream=None, poizon=None):
                 r.get('kream_price'),
                 s['kream_fee_rate'],
                 s['shipping_cost'],
-                s['packing_cost'] + s.get('other_cost', 0) + s.get('kream_fixed_cost', 0),
+                s['packing_cost'],
                 s['target_profit'],
                 s['target_roi']
             )
         elif platform == 'POIZON' and pd.notna(r.get('poizon_buyer_price', None)):
-            payout_used = r.get('poizon_payout_used', None)
-            if payout_used is not None and pd.notna(payout_used):
-                net_before_buy = (
-                    float(payout_used)
-                    - float(s['shipping_cost'])
-                    - float(s['packing_cost'])
-                    - float(s.get('other_cost', 0))
-                )
-                by_profit = net_before_buy - float(s['target_profit'])
-                by_roi = net_before_buy / (1 + float(s['target_roi'])/100.0)
-                mb = max(min(by_profit, by_roi), 0.0)
-            else:
-                mb = calc_max_buy_price(
-                    r.get('poizon_buyer_price'),
-                    s['poizon_fee_rate'],
-                    s['shipping_cost'],
-                    s['packing_cost'] + s.get('other_cost', 0) + s.get('poizon_fixed_cost', 0),
-                    s['target_profit'],
-                    s['target_roi']
-                )
+            # When POIZON expected-profit/payout exists we keep the existing profit engine,
+            # but max-buy-price uses buyer-visible price and the configured estimated fee.
+            mb = calc_max_buy_price(
+                r.get('poizon_buyer_price'),
+                s['poizon_fee_rate'],
+                s['shipping_cost'],
+                s['packing_cost'],
+                s['target_profit'],
+                s['target_roi']
+            )
         max_buy.append(mb)
 
         cur = r.get('buy_price_num')
@@ -825,92 +794,6 @@ def compute_compare(base, kream=None, poizon=None):
             guidance.append('관찰 유지')
 
     df['권장최대매입가'] = max_buy
-
-    # ===== V17.6 안전마진 재판정 =====
-    safety_margin_values = []
-    new_grade = []
-    new_reason = []
-    new_qty = []
-
-    safe_roi = float(s.get('safe_buy_roi', 25.0))
-    safe_margin = float(s.get('safe_buy_margin', 10000))
-
-    for _, r in df.iterrows():
-        cur_grade = r.get('판정', '⚪ 데이터부족')
-        reason = str(r.get('판정이유', '') or '')
-        qty = int(r.get('추천구매수량', 0) or 0)
-
-        cur_buy = r.get('buy_price_num')
-        mb = r.get('권장최대매입가')
-        roi = r.get('best_roi')
-        margin = None
-        if cur_buy is not None and pd.notna(cur_buy) and mb is not None and pd.notna(mb):
-            margin = float(mb) - float(cur_buy)
-        safety_margin_values.append(margin)
-
-        if cur_grade not in ('🟢🟢 강력매입', '🟢 매입추천', '🟠 1개 테스트'):
-            new_grade.append(cur_grade)
-            new_reason.append(reason)
-            new_qty.append(qty)
-            continue
-
-        if margin is not None and margin < 0:
-            new_grade.append('🟡 관찰')
-            new_reason.append(f'안전마진 부족: 현재가가 최대매입가보다 {abs(margin):,.0f}원 높음')
-            new_qty.append(0)
-            continue
-
-        roi_val = float(roi) if roi is not None and pd.notna(roi) else None
-        roi_safe = roi_val is not None and roi_val >= safe_roi
-        margin_safe = margin is not None and margin >= safe_margin
-
-        if not roi_safe or not margin_safe:
-            details = []
-            if not roi_safe:
-                details.append(f'ROI {roi_val:.1f}% < 안전기준 {safe_roi:.1f}%' if roi_val is not None else 'ROI 확인 필요')
-            if margin is None:
-                details.append('최대매입가 안전여유 확인 필요')
-            elif not margin_safe:
-                details.append(f'매입가 여유 {margin:,.0f}원 < 안전기준 {safe_margin:,.0f}원')
-            new_grade.append('🟠 1개 테스트')
-            new_reason.append(' / '.join(details))
-            new_qty.append(1)
-            continue
-
-        new_grade.append(cur_grade)
-        new_reason.append(reason)
-        new_qty.append(qty)
-
-    df['매입안전여유'] = safety_margin_values
-    df['판정'] = new_grade
-    df['판정이유'] = new_reason
-    df['추천구매수량'] = new_qty
-
-    guidance = []
-    for _, r in df.iterrows():
-        mb = r.get('권장최대매입가')
-        cur = r.get('buy_price_num')
-        sales = r.get('best_30d_sales')
-        margin = r.get('매입안전여유')
-        grade_now = r.get('판정', '')
-
-        if mb is None or pd.isna(mb):
-            guidance.append('가격 데이터 확인')
-        elif cur is not None and pd.notna(cur) and cur > mb:
-            guidance.append(f'현재 매입가가 권장 상한보다 {cur-mb:,.0f}원 높음')
-        elif grade_now == '🟠 1개 테스트':
-            guidance.append(
-                f'1개 테스트 · 안전여유 {float(margin):,.0f}원'
-                if margin is not None and pd.notna(margin)
-                else '1개 테스트 권장'
-            )
-        elif r.get('추천구매수량', 0) >= 2:
-            guidance.append(f"추천 {int(r.get('추천구매수량', 0))}개 · 안전여유 {float(margin):,.0f}원 · 분할매입")
-        elif sales is None or pd.isna(sales):
-            guidance.append('수익성은 확인됨 · 판매량 확인 필요')
-        else:
-            guidance.append('관찰 유지')
-
     df['매입가이드'] = guidance
     return df
 
@@ -990,19 +873,13 @@ def score_discovery(df):
 
         if sell_ref is not None and pd.notna(sell_ref):
             mb = calc_max_buy_price(
-                sell_ref, s['poizon_fee_rate'], s['shipping_cost'], s['packing_cost'] + s.get('other_cost', 0),
+                sell_ref, s['poizon_fee_rate'], s['shipping_cost'], s['packing_cost'],
                 s['target_profit'], s['target_roi']
             )
 
         # 국내 소싱가까지 입력되면 실제 1족 테스트 여부를 판정한다.
         if buy is not None and pd.notna(buy) and buy > 0 and sell_ref is not None and pd.notna(sell_ref):
-            net = (
-                float(sell_ref) * (1 - float(s['poizon_fee_rate']))
-                - float(s.get('poizon_fixed_cost', 0))
-                - float(s['shipping_cost'])
-                - float(s['packing_cost'])
-                - float(s.get('other_cost', 0))
-            ) - float(s.get('other_cost', 0))
+            net = float(sell_ref) * (1 - float(s['poizon_fee_rate'])) - float(s['shipping_cost']) - float(s['packing_cost'])
             profit = net - float(buy)
             roi = profit / float(buy) * 100 if buy else None
             if profit <= 0:
@@ -1698,14 +1575,14 @@ def candidate_telegram_text(df, title='⭐ KREAM·POIZON 소싱 후보'):
             '', f"{i}. {val('판정','')} {val('상품명','')} {val('모델','')}",
             f"사이즈: KR {val('KR사이즈','-')} / EU {val('EU사이즈','-')}",
             f"매입가: {won('현재매입가')} / 최대매입가: {won('권장최대매입가')}",
-            f"판매처: {val('추천판매처','-')} / 최종순익: {won('최고예상순익')} / ROI: {roi}",
+            f"판매처: {val('추천판매처','-')} / 예상순익: {won('최고예상순익')} / ROI: {roi}",
             f"30일 판매: {val('추천처30일판매','-')} / 추천수량: {val('추천구매수량',0)}개"
         ]
     if len(df)>20: lines += ['', f'외 {len(df)-20}개는 프로그램 후보목록에서 확인']
     return '\n'.join(lines)
 
 def field_decision_telegram_text(df, product_name='', model=''):
-    """V17.5: Telegram field decision with itemized real-cost breakdown."""
+    """Compact field-buying decision for Telegram: best first, then test sizes, then holds."""
     title = '📲 현장 역소싱 판정'
     if df is None or len(df) == 0:
         return title + '\n현재 전송할 판정 데이터가 없습니다.'
@@ -1713,110 +1590,40 @@ def field_decision_telegram_text(df, product_name='', model=''):
     d = df.copy()
     if '판정' not in d.columns:
         return title + '\n판정 열이 없습니다.'
-
     rank = {'🟢🟢 강력매입':0, '🟢 매입추천':1, '🟠 1개 테스트':2, '🟡 관찰':3, '🔴 PASS':4, '⚪ 데이터부족':5}
     d['_tg_rank'] = d['판정'].map(rank).fillna(9)
-    d['_tg_profit'] = pd.to_numeric(d.get('최고예상순익'), errors='coerce').fillna(-1) if '최고예상순익' in d.columns else -1
+    if '최고예상순익' in d.columns:
+        d['_tg_profit'] = pd.to_numeric(d['최고예상순익'], errors='coerce').fillna(-1)
+    else:
+        d['_tg_profit'] = -1
     d = d.sort_values(['_tg_rank','_tg_profit'], ascending=[True,False])
 
-    def clean(v, default='-'):
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return default
-        s = str(v).strip()
-        return default if not s or s.lower() in ('none','nan','nat') else s
-
     def txt(r, c, default='-'):
-        return clean(r.get(c, default), default)
-
-    def money(v):
-        try:
-            return f"{float(v):,.0f}원" if v is not None and pd.notna(v) else '-'
-        except Exception:
-            return '-'
-
+        x = r.get(c, default)
+        return default if pd.isna(x) or str(x).strip() in ('','None','nan') else str(x)
     def won(r, c):
-        return money(r.get(c))
-
+        try: return f"{float(r.get(c)):,.0f}원" if pd.notna(r.get(c)) else '-'
+        except: return '-'
     def roi(r):
-        try:
-            return f"{float(r.get('최고ROI(%)')):.1f}%" if pd.notna(r.get('최고ROI(%)')) else '-'
-        except Exception:
-            return '-'
-
-    product_name = clean(product_name, '')
-    if not product_name:
-        product_name = '상품명 미등록'
+        try: return f"{float(r.get('최고ROI(%)')):.1f}%" if pd.notna(r.get('최고ROI(%)')) else '-'
+        except: return '-'
 
     actionable = d[d['판정'].isin(['🟢🟢 강력매입','🟢 매입추천','🟠 1개 테스트'])]
-    lines = [title, f"상품: {product_name}", f"품번: {model or txt(d.iloc[0],'모델')}"]
-
+    lines=[title, f"상품: {product_name or '-'}", f"품번: {model or txt(d.iloc[0],'모델')}"]
     if len(actionable):
         best = actionable.iloc[0]
-        platform = txt(best, '추천판매처', '-')
-        buy_price = best.get('현재매입가')
-        shipping = float(st.session_state.settings.get('shipping_cost', 0))
-        packing = float(st.session_state.settings.get('packing_cost', 0))
-        other = float(st.session_state.settings.get('other_cost', 0))
-
-        if platform == 'KREAM':
-            sell_price = best.get('KREAM가격')
-            platform_fee = best.get('KREAM수수료')
-            fixed_cost = best.get('KREAM고정비')
-            fee_label = 'KREAM 수수료'
-        else:
-            sell_price = best.get('POIZON구매자노출가')
-            platform_fee = best.get('POIZON플랫폼공제')
-            fixed_cost = 0
-            fee_label = 'POIZON 플랫폼 공제'
-
-        lines += [
-            '',
-            f"{txt(best,'판정')} BEST: KR {txt(best,'KR사이즈')}",
-            f"추천판매처: {platform}",
-            '',
-            '💰 비용 차감 내역',
-            f"판매 기준가: {money(sell_price)}",
-            f"상품 매입가: -{money(buy_price)}",
-            f"{fee_label}: -{money(platform_fee)}",
-        ]
-        if fixed_cost is not None and pd.notna(fixed_cost) and float(fixed_cost) > 0:
-            lines.append(f"플랫폼 고정비: -{money(fixed_cost)}")
-        lines += [
-            f"배송비: -{money(shipping)}",
-            f"포장비: -{money(packing)}",
-            f"기타비용: -{money(other)}",
-            '────────────',
-            f"💵 실제 예상 순이익: {won(best,'최고예상순익')}",
-            f"📈 실제 ROI: {roi(best)}",
-            f"🔄 30일 판매: {txt(best,'추천처30일판매')}개",
-            f"👉 추천 수량: {txt(best,'추천구매수량','0')}개",
-            f"🚨 최대 매입가: {won(best,'권장최대매입가')}",
-        ]
-
-        # V17.6.1: 안전여유 실제 숫자 + 부족/충족 상태를 명확히 표시
-        _margin_v = best.get('매입안전여유')
-        _safe_margin_req = float(st.session_state.settings.get('safe_buy_margin', 10000))
-        if _margin_v is not None and pd.notna(_margin_v):
-            _margin_status = '✅ 충족' if float(_margin_v) >= _safe_margin_req else '⚠️ 부족'
-            lines.append(
-                f"🛡 매입가 안전여유: {money(_margin_v)} {_margin_status} "
-                f"(기준 {money(_safe_margin_req)})"
-            )
-        else:
-            lines.append("🛡 매입가 안전여유: 확인 필요")
-
-        lines += [
-        ]
-
+        lines += ['', f"{txt(best,'판정')} BEST: KR {txt(best,'KR사이즈')}",
+                  f"매입가: {won(best,'현재매입가')}",
+                  f"추천판매처: {txt(best,'추천판매처')}",
+                  f"예상순익: {won(best,'최고예상순익')} | ROI: {roi(best)}",
+                  f"30일 판매: {txt(best,'추천처30일판매')}개",
+                  f"👉 추천: {txt(best,'추천구매수량','0')}개 매입",
+                  f"💰 최대 매입가: {won(best,'권장최대매입가')}"]
         others = actionable.iloc[1:7]
         if len(others):
             lines += ['', '🟠 추가 후보']
             for _, r in others.iterrows():
-                lines.append(
-                    f"KR {txt(r,'KR사이즈')} · {txt(r,'판정')} · "
-                    f"순이익 {won(r,'최고예상순익')} · ROI {roi(r)} · "
-                    f"여유 {won(r,'매입안전여유')} · {txt(r,'추천구매수량','0')}개"
-                )
+                lines.append(f"KR {txt(r,'KR사이즈')} · {txt(r,'판정')} · 순익 {won(r,'최고예상순익')} · ROI {roi(r)} · {txt(r,'추천구매수량','0')}개")
     else:
         lines += ['', '🔴 지금 바로 매입할 추천 사이즈 없음']
 
@@ -1824,14 +1631,7 @@ def field_decision_telegram_text(df, product_name='', model=''):
     if len(holds):
         sizes = ', '.join('KR '+txt(r,'KR사이즈') for _,r in holds.head(12).iterrows())
         lines += ['', f"⏸ 보류/관찰: {sizes}"]
-
-    lines += [
-        '',
-        '※ 순이익 = 판매기준가 - 플랫폼공제 - 매입가 - 배송 - 포장 - 기타비용',
-        '※ POIZON이 정산예정액을 직접 제공하면 그 값을 우선 사용합니다.',
-        '※ 🟢 매입추천은 안전 ROI와 최대매입가 안전여유를 모두 충족해야 합니다.',
-        '※ 실제 결제 전 판매자센터의 최신 수수료/정산액을 최종 확인하세요.'
-    ]
+    lines += ['', '※ 현장 판정은 현재 입력된 가격·최근 판매량 기준']
     return '\n'.join(lines)
 
 def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target_profit, target_roi):
@@ -1851,30 +1651,151 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V17.6.1 SAFETY MARGIN FIX')
-st.caption('Build: V17.6.1 · 안전여유 텔레그램 표시 수정 + 실제 순이익 + 안전마진 판정')
+
+
+def _lotteon_extract_model(text):
+    """아디다스/나이키에서 자주 쓰는 품번 형태를 우선 추출."""
+    t = re.sub(r'\s+', ' ', str(text or '')).upper()
+    patterns = [
+        r'\b([A-Z]{2}\d{4})\b',                 # Adidas: JQ9826, IF6490
+        r'\b([A-Z]{2}\d{4}-\d{3})\b',        # Nike: HF1234-001
+        r'\b([A-Z]{1,3}\d{3,6}[A-Z]?)\b',     # 보조 패턴
+    ]
+    for p in patterns:
+        m = re.search(p, t)
+        if m:
+            return m.group(1)
+    return ''
+
+
+def _lotteon_price_num(text):
+    vals=[]
+    for m in re.finditer(r'(?<!\d)(\d{1,3}(?:,\d{3})+)\s*원?', str(text or '')):
+        try:
+            n=int(m.group(1).replace(',',''))
+            if 1000 <= n <= 5000000:
+                vals.append(n)
+        except Exception:
+            pass
+    return vals
+
+
+def fetch_lotteon_search(brand='아디다스', max_items=120):
+    """롯데백화점(mallId=2) 검색결과에서 신발 후보를 수집.
+    사이트 구조 변경/접근차단 시 빈 결과와 진단 메시지를 반환한다.
+    """
+    brand = str(brand or '').strip()
+    url = 'https://www.lotteon.com/csearch/search/search?' + urllib.parse.urlencode({
+        'render':'search','platform':'pc','q':brand,'mallId':'2'
+    })
+    headers={
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+        'Accept-Language':'ko-KR,ko;q=0.9,en;q=0.7',
+        'Referer':'https://www.lotteon.com/'
+    }
+    try:
+        r=requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        html=r.text
+    except Exception as e:
+        return pd.DataFrame(), url, f'롯데ON 접속 실패: {e}'
+
+    rows=[]
+    # 1) HTML 링크 기반 파싱. BeautifulSoup가 있으면 사용.
+    try:
+        from bs4 import BeautifulSoup
+        soup=BeautifulSoup(html,'html.parser')
+        for a in soup.find_all('a', href=True):
+            txt=' '.join(a.stripped_strings)
+            href=a.get('href','')
+            if not txt or len(txt) < 8:
+                continue
+            low=txt.lower()
+            # 브랜드 및 신발성 키워드. 상품명에 브랜드가 생략된 카드도 허용.
+            if brand == '아디다스':
+                brand_ok=('아디다스' in txt or 'adidas' in low)
+            else:
+                brand_ok=('나이키' in txt or 'nike' in low)
+            shoe_ok=any(k in low for k in ['운동화','스니커','러닝','슈즈','신발','sneaker','running','shoe','조던','에어맥스','삼바','가젤','아디제로'])
+            model=_lotteon_extract_model(txt)
+            prices=_lotteon_price_num(txt)
+            if not brand_ok and not model:
+                continue
+            if not shoe_ok and not model:
+                continue
+            if not prices:
+                continue
+            full=urllib.parse.urljoin('https://www.lotteon.com', href)
+            # 현재가/정상가는 카드 내 가격들의 최소/최대로 보수 추정
+            current=min(prices)
+            retail=max(prices)
+            if retail < current: retail=current
+            disc=round((retail-current)/retail*100,1) if retail>current else 0.0
+            rows.append({
+                '선택':False,'브랜드':brand,'상품명':txt[:240],'품번':model,
+                '현재가':current,'정상가':retail,'할인율(%)':disc,
+                '링크':full,'수집상태':'자동수집'
+            })
+    except Exception:
+        pass
+
+    # 2) JSON/스크립트 안 상품 텍스트 보조 파싱: 품번 주변에서 가격 찾기.
+    if len(rows) < 5:
+        clean=re.sub(r'<[^>]+>', ' ', html)
+        clean=re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1),16)), clean)
+        clean=re.sub(r'\\/', '/', clean)
+        clean=re.sub(r'\s+', ' ', clean)
+        for mm in re.finditer(r'([A-Z]{2}\d{4}(?:-\d{3})?)', clean.upper()):
+            a=max(0,mm.start()-180); b=min(len(clean),mm.end()+280)
+            chunk=clean[a:b]
+            prices=_lotteon_price_num(chunk)
+            if not prices: continue
+            model=mm.group(1)
+            current=min(prices); retail=max(prices); retail=max(retail,current)
+            disc=round((retail-current)/retail*100,1) if retail>current else 0.0
+            rows.append({'선택':False,'브랜드':brand,'상품명':chunk[:240],'품번':model,'현재가':current,'정상가':retail,'할인율(%)':disc,'링크':url,'수집상태':'보조추출'})
+
+    if not rows:
+        return pd.DataFrame(), url, '검색 페이지는 열렸지만 상품카드를 읽지 못했습니다. 롯데ON 페이지 구조 변경 또는 자동접근 차단 가능성이 있습니다.'
+
+    d=pd.DataFrame(rows)
+    # 품번+가격+링크 기준 중복 제거
+    d['_key']=d['품번'].fillna('').astype(str)+'|'+d['현재가'].astype(str)+'|'+d['링크'].astype(str)
+    d=d.drop_duplicates('_key').drop(columns=['_key']).head(int(max_items)).reset_index(drop=True)
+    return d, url, f'{len(d)}개 후보 수집'
+
+
+def save_lotteon_db(df):
+    df.to_csv(LOTTEON_PATH,index=False,encoding='utf-8-sig')
+
+
+def load_lotteon_db():
+    if LOTTEON_PATH.exists():
+        try:
+            d=pd.read_csv(LOTTEON_PATH)
+            if '선택' not in d.columns: d.insert(0,'선택',False)
+            return d
+        except Exception:
+            pass
+    return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
+
+st.title('KREAM · POIZON · COUPANG 소싱 V18.0')
+st.caption('Build: V18.0 · 롯데ON 아디다스/나이키 자동소싱 1단계 + 기존 POIZON/KREAM 비교 유지')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
     st.header('판정 기준')
     s=st.session_state.settings
     s['shipping_cost']=st.number_input('건당 배송비(원)',0,100000,int(s['shipping_cost']),500)
-    s['packing_cost']=st.number_input('포장비(원)',0,50000,int(s['packing_cost']),500)
-    s['other_cost']=st.number_input('기타 추가비용(원)',0,200000,int(s.get('other_cost',0)),500, help='관세·검수·추가 운영비 등 실제로 더 드는 비용이 있으면 입력')
+    s['packing_cost']=st.number_input('포장/기타비(원)',0,50000,int(s['packing_cost']),500)
     s['kream_fee_rate']=st.number_input('KREAM 수수료율',0.0,0.5,float(s['kream_fee_rate']),0.005,format='%.3f')
-    s['kream_fixed_cost']=st.number_input('KREAM 건당 추가 고정비(원)',0,100000,int(s.get('kream_fixed_cost',0)),500)
-    s['poizon_fee_rate']=st.number_input('POIZON 추정 수수료율',0.0,0.5,float(s['poizon_fee_rate']),0.005,format='%.3f',help='기본값 10%. 실제 판매자센터 정산률이 다르면 수정')
-    s['poizon_fixed_cost']=st.number_input('POIZON 건당 추가 고정비(원)',0,100000,int(s.get('poizon_fixed_cost',0)),500,help='정산예정액에 이미 포함된 비용이면 0원')
+    s['poizon_fee_rate']=st.number_input('POIZON 추정 수수료율',0.0,0.5,float(s['poizon_fee_rate']),0.005,format='%.3f')
     s['target_profit']=st.number_input('추천 최소 순익',0,200000,int(s['target_profit']),1000)
-    s['target_roi']=st.number_input('최소 허용 ROI(%)',0.0,200.0,float(s['target_roi']),1.0)
-    s['safe_buy_roi']=st.number_input('🛡 매입추천 안전 ROI(%)',0.0,200.0,float(s.get('safe_buy_roi',25.0)),1.0,
-                                      help='이 값 미만이면 수익성이 있어도 1개 테스트로 낮춥니다.')
-    s['safe_buy_margin']=st.number_input('🛡 최대매입가 안전여유(원)',0,200000,int(s.get('safe_buy_margin',10000)),1000,
-                                         help='권장 최대매입가 - 현재 매입가가 이 금액보다 작으면 1개 테스트로 낮춥니다.')
+    s['target_roi']=st.number_input('추천 최소 ROI(%)',0.0,200.0,float(s['target_roi']),1.0)
     s['min_30d_sales']=st.number_input('추천 최소 30일 판매량',0,100000,int(s['min_30d_sales']),10)
-    st.info('표시 순익은 매입가 + 플랫폼 수수료(또는 POIZON 정산예정액 반영) + 배송비 + 포장비 + 기타비용을 모두 차감한 예상 최종 순이익입니다. 실제 수수료는 계정/카테고리에 따라 달라질 수 있으니 판매 확정 전 정산화면으로 최종 확인하세요.')
+    st.info('수수료는 실제 계정/카테고리에 따라 달라질 수 있습니다. 판매 확정 전 플랫폼 정산화면으로 최종 확인하세요.')
 
-tf,t0,t1,t2,t3,t4,t5,t6=st.tabs(['📸 현장 카메라','🔥 POIZON 후보발굴','① 상품등록','② POIZON 가져오기','③ KREAM 가져오기','④ 자동 비교','⑤ 사용법','⑥ 오늘 살 것'])
+tf,tl,t0,t1,t2,t3,t4,t5,t6=st.tabs(['📸 현장 카메라','🛍️ 롯데 자동소싱','🔥 POIZON 후보발굴','① 상품등록','② POIZON 가져오기','③ KREAM 가져오기','④ 자동 비교','⑤ 사용법','⑥ 오늘 살 것'])
 
 
 with tf:
@@ -2008,6 +1929,98 @@ with tf:
             )
             ok, m = send_telegram_message(msg)
             (st.success if ok else st.error)(m)
+
+
+with tl:
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · 1단계')
+    st.caption('현재는 아디다스·나이키 신발 후보의 상품명/품번/가격/할인율/링크를 자동 수집합니다. 다음 단계에서 POIZON·KREAM·쿠팡 자동비교를 연결합니다.')
+    st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
+
+    c1,c2,c3=st.columns([1,1,1])
+    use_adidas=c1.checkbox('아디다스',value=True,key='lotte_adidas')
+    use_nike=c2.checkbox('나이키',value=True,key='lotte_nike')
+    min_discount=c3.number_input('최소 할인율(%)',0.0,90.0,15.0,5.0,key='lotte_min_discount')
+    max_items=st.slider('브랜드별 최대 수집 수',20,200,80,20,key='lotte_max_items')
+
+    b1,b2=st.columns([3,1])
+    if b1.button('🔎 아디다스 + 나이키 자동수집 시작',type='primary',width='stretch',key='lotte_fetch'):
+        brands=[]
+        if use_adidas: brands.append('아디다스')
+        if use_nike: brands.append('나이키')
+        if not brands:
+            st.warning('브랜드를 하나 이상 선택하세요.')
+        else:
+            all_df=[]; msgs=[]
+            with st.spinner('롯데ON 백화점몰 상품을 확인하고 있습니다...'):
+                for brand in brands:
+                    d,u,m=fetch_lotteon_search(brand,max_items=max_items)
+                    msgs.append(f'{brand}: {m}')
+                    if len(d): all_df.append(d)
+            for m in msgs: st.caption(m)
+            if all_df:
+                got=pd.concat(all_df,ignore_index=True)
+                save_lotteon_db(got)
+                st.session_state['lotteon_results']=got
+                st.success(f'수집 완료: 총 {len(got)}개 후보')
+            else:
+                st.error('이번 실행에서는 자동수집 결과가 없습니다. 아래 롯데ON 검색 버튼으로 페이지가 정상 노출되는지 먼저 확인해 주세요.')
+
+    if b2.button('🧹 결과 비우기',width='stretch',key='lotte_clear'):
+        empty=load_lotteon_db().iloc[0:0]
+        save_lotteon_db(empty)
+        st.session_state['lotteon_results']=empty
+        st.rerun()
+
+    q1,q2=st.columns(2)
+    q1.link_button('롯데백화점 아디다스 직접 확인','https://www.lotteon.com/csearch/search/search?render=search&platform=pc&q=%EC%95%84%EB%94%94%EB%8B%A4%EC%8A%A4&mallId=2',width='stretch')
+    q2.link_button('롯데백화점 나이키 직접 확인','https://www.lotteon.com/csearch/search/search?render=search&platform=pc&q=%EB%82%98%EC%9D%B4%ED%82%A4&mallId=2',width='stretch')
+
+    lotte=st.session_state.get('lotteon_results')
+    if lotte is None or not isinstance(lotte,pd.DataFrame):
+        lotte=load_lotteon_db()
+    if len(lotte):
+        view=lotte.copy()
+        view['할인율(%)']=pd.to_numeric(view['할인율(%)'],errors='coerce').fillna(0)
+        view=view[view['할인율(%)']>=float(min_discount)].copy()
+        st.markdown(f'### 조건 통과 후보 · {len(view)}개')
+        edited=st.data_editor(
+            view,
+            width='stretch',height=500,hide_index=True,key='lotte_editor_v18',
+            column_config={
+                '선택':st.column_config.CheckboxColumn('선택'),
+                '현재가':st.column_config.NumberColumn('현재가',format='%,d원'),
+                '정상가':st.column_config.NumberColumn('정상가',format='%,d원'),
+                '할인율(%)':st.column_config.NumberColumn('할인율',format='%.1f%%'),
+                '링크':st.column_config.LinkColumn('상품보기',display_text='열기'),
+            }
+        )
+        selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
+        a1,a2=st.columns(2)
+        if a1.button('➕ 선택상품을 우리 비교목록에 넣기',width='stretch',key='lotte_add_selected'):
+            if len(selected)==0:
+                st.warning('먼저 후보 왼쪽의 선택을 체크하세요.')
+            else:
+                ok=0; skipped=0
+                for _,r in selected.iterrows():
+                    model=str(r.get('품번','') or '').strip()
+                    price=won_to_num(r.get('현재가'))
+                    if not model or not price:
+                        skipped+=1; continue
+                    upsert_product(model,int(price),f"{r.get('브랜드','')} {r.get('상품명','')}")
+                    ok+=1
+                st.success(f'비교목록에 {ok}개 추가 · 품번/가격 미확인 {skipped}개 제외')
+        if a2.button('📲 선택상품 텔레그램 전송',width='stretch',key='lotte_send_selected'):
+            if len(selected)==0:
+                st.warning('전송할 상품을 선택하세요.')
+            else:
+                lines=['🛍️ [롯데백화점 자동소싱 후보]']
+                for _,r in selected.head(15).iterrows():
+                    lines += ['',f"{r.get('브랜드','')} · {r.get('품번','-')}",str(r.get('상품명',''))[:70],f"매입가 {int(float(r.get('현재가',0))):,}원 · 할인 {float(r.get('할인율(%)',0)):.1f}%",str(r.get('링크',''))]
+                ok,msg=send_telegram_message('\n'.join(lines))
+                (st.success if ok else st.error)(msg)
+        st.caption('품번이 비어 있거나 상품명이 이상한 행은 아직 매입하지 말고 상품 상세페이지에서 품번을 먼저 확인하세요.')
+    else:
+        st.warning('아직 수집된 상품이 없습니다. 위의 자동수집 버튼을 눌러 첫 테스트를 시작하세요.')
 
 
 with t0:
@@ -2474,11 +2487,10 @@ with t4:
 
         compact_cols=[
             '판정','판정이유','매입가이드','추천구매수량','model','size','eu_size','sku_id',
-            'buy_price_num','권장최대매입가','매입안전여유',
+            'buy_price_num','권장최대매입가',
             'best_platform','best_profit','best_roi','best_30d_sales',
-            'kream_price','kream_30d_sales','kream_fee_amount','kream_fixed_cost',
-            'poizon_avg_price','poizon_buyer_price','poizon_30d_sales',
-            'poizon_fee_amount','poizon_fixed_cost','poizon_payout_used','poizon_expected_profit'
+            'kream_price','kream_30d_sales',
+            'poizon_avg_price','poizon_buyer_price','poizon_30d_sales'
         ]
         compact_cols=[c for c in compact_cols if c in result.columns]
         compact=result[compact_cols].copy()
@@ -2494,22 +2506,15 @@ with t4:
             'sku_id':'POIZON SKU',
             'buy_price_num':'현재매입가',
             '권장최대매입가':'권장최대매입가',
-            '매입안전여유':'매입안전여유',
             'best_platform':'추천판매처',
             'best_profit':'최고예상순익',
             'best_roi':'최고ROI(%)',
             'best_30d_sales':'추천처30일판매',
             'kream_price':'KREAM가격',
             'kream_30d_sales':'KREAM30일판매',
-            'kream_fee_amount':'KREAM수수료',
-            'kream_fixed_cost':'KREAM고정비',
             'poizon_avg_price':'POIZON평균가',
             'poizon_buyer_price':'POIZON구매자노출가',
-            'poizon_30d_sales':'POIZON30일판매',
-            'poizon_fee_amount':'POIZON플랫폼공제',
-            'poizon_fixed_cost':'POIZON고정비',
-            'poizon_payout_used':'POIZON정산기준액',
-            'poizon_expected_profit':'POIZON제공정산액'
+            'poizon_30d_sales':'POIZON30일판매'
         }
         compact=compact.rename(columns=rename_map)
 
@@ -2521,7 +2526,6 @@ with t4:
             column_config={
                 '현재매입가': st.column_config.NumberColumn(format='%,.0f원'),
                 '권장최대매입가': st.column_config.NumberColumn(format='%,.0f원'),
-                '매입안전여유': st.column_config.NumberColumn(format='%,.0f원'),
                 '최고예상순익': st.column_config.NumberColumn(format='%,.0f원'),
                 '최고ROI(%)': st.column_config.NumberColumn(format='%.1f%%'),
                 'KREAM가격': st.column_config.NumberColumn(format='%,.0f원'),
@@ -2547,17 +2551,9 @@ with t4:
 
         st.info('POIZON은 30일 판매량 데이터가 없으면 수익성이 좋아도 자동으로 🟡 관찰로 유지합니다. 실제 매입 전 POIZON 판매량/회전성은 별도로 확인하세요.')
 
-        # ===== V17.5: 현장용 원클릭 Telegram 판정 =====
-        _raw_name = base.iloc[0].get('name','') if len(base) else ''
-        _product_name = '' if pd.isna(_raw_name) or str(_raw_name).strip().lower() == 'nan' else str(_raw_name).strip()
-        if not _product_name:
-            _meta = st.session_state.get('poizon_api_meta', {}) or {}
-            _meta_name = _meta.get('name', '') if isinstance(_meta, dict) else ''
-            if _meta_name and str(_meta_name).strip().lower() != 'nan':
-                _product_name = str(_meta_name).strip()
-        if not _product_name:
-            _product_name = f'품번 {_active_canonical}'
-        if st.button('📲 현장판정 텔레그램 전송', type='primary', width='stretch', key='telegram_field_decision_v1761'):
+        # ===== V17.3: 현장용 원클릭 Telegram 판정 =====
+        _product_name = str(base.iloc[0].get('name','') or '').strip() if len(base) else ''
+        if st.button('📲 현장판정 텔레그램 전송', type='primary', width='stretch', key='telegram_field_decision_v173'):
             _tg_text = field_decision_telegram_text(compact, _product_name, _active_canonical)
             ok, msg = send_telegram_message(_tg_text)
             (st.success if ok else st.error)(msg)
