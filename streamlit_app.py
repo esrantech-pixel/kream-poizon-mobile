@@ -127,6 +127,10 @@ def set_active_model(model, clear_live_platform=True):
         st.session_state.pop('poizon_api_meta', None)
         st.session_state.pop('poizon_api_raw', None)
     st.session_state['_active_model'] = model
+    # V18.6: keep downstream POIZON/KREAM tabs synchronized with the active sourcing model.
+    # set_active_model is called before those widgets are rendered in this app, so this is safe.
+    st.session_state['pmodel'] = model
+    st.session_state['kmodel'] = model
 
 def resolve_active_product(base, requested_model=''):
     """Return one canonical product row plus KREAM/POIZON aliases."""
@@ -2040,8 +2044,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.5')
-st.caption('Build: V18.5 · 롯데ON 한글 상품명 정상화 + POIZON/KREAM 비교목록 원클릭 전달')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.6')
+st.caption('Build: V18.6 · 롯데ON 1개 테스트 → POIZON 공식 API 직결 + KREAM 입력 준비')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2193,7 +2197,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V18.5')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V18.6')
     st.caption('현재는 아디다스·나이키 신발 후보의 상품명/품번/가격/할인율/링크를 자동 수집합니다. 다음 단계에서 POIZON·KREAM·쿠팡 자동비교를 연결합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -2266,10 +2270,11 @@ with tl:
         picked=next((x['원본주변'] for x in drows if x['품번후보']==pick),'')
         st.code(picked,language='json')
         extracted=_lotteon_diag_extract_fields(picked,diag_brand,pick)
-        st.markdown('#### ✅ V18.5 실제 필드 추출 결과')
+        st.markdown('#### ✅ V18.6 실제 필드 추출 결과')
         st.dataframe(pd.DataFrame([extracted]),width='stretch',hide_index=True)
         if extracted.get('현재가'):
-            st.caption(f"확인값 → 상품명: {extracted.get('상품명','-')} / 현재가: {int(extracted.get('현재가') or 0):,}원 / 정상가: {int(extracted.get('정상가') or 0):,}원 / 할인율: {extracted.get('할인율(%)','-')}%")
+            st.caption(f"진단 원문값 → 상품명: {extracted.get('상품명','-')} / 가격후보: {int(extracted.get('현재가') or 0):,}원 / 정상가후보: {int(extracted.get('정상가') or 0):,}원 / 할인율: {extracted.get('할인율(%)','-')}%")
+            st.caption('※ 진단 조각은 상품 객체의 일부만 볼 수 있어 할인가가 빠질 수 있습니다. 실제 매입가는 아래 조건 통과 후보표의 현재가(검색목록 최종가)를 우선 사용합니다.')
         keys=st.session_state.get('lotte_diag_keys',[]) or []
         if keys:
             st.caption('원문에서 발견한 가격/상품 관련 키 후보: '+', '.join(keys[:60]))
@@ -2323,6 +2328,55 @@ with tl:
             }
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
+        # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
+        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.6')
+        st.caption('후보 1개를 골라 롯데 매입가를 고정하고 POIZON 공식 API까지 바로 연결합니다. KREAM은 다음 탭에서 휴대폰 즉시판매가만 입력하면 자동비교가 완성됩니다.')
+        _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
+        if _test_models:
+            _default_idx=_test_models.index('JQ9826') if 'JQ9826' in _test_models else 0
+            _test_model=st.selectbox('테스트할 품번',_test_models,index=_default_idx,key='lotte_v186_test_model')
+            _test_hit=view[view['품번'].astype(str)==str(_test_model)]
+            if len(_test_hit):
+                _tr=_test_hit.iloc[0]
+                _test_buy=int(won_to_num(_tr.get('현재가')) or 0)
+                _test_name=_lotteon_clean_name(_tr.get('상품명',''),_tr.get('브랜드',''),_test_model)
+                st.info(f'롯데 기준 매입가: {_test_buy:,}원 · {_test_name}')
+                _t1,_t2=st.columns([2,1])
+                if _t1.button('🚀 이 상품 POIZON 공식조회까지 시작',type='primary',width='stretch',key='lotte_v186_poizon_test'):
+                    upsert_product(_test_model,_test_buy,_test_name)
+                    set_active_model(_test_model,clear_live_platform=True)
+                    st.session_state[f'current_buy_price__{_test_model}']=_test_buy
+                    try:
+                        with st.spinner(f'POIZON 공식 API에서 {_test_model} 전 사이즈를 조회하는 중...'):
+                            _api_df,_api_meta,_api_raw=poizon_lookup_article_official(_test_model)
+                        st.session_state['poizon_df']=_api_df.copy()
+                        st.session_state['poizon_api_meta']=_api_meta
+                        st.session_state['poizon_api_raw']=_api_raw
+                        if len(_api_df):
+                            upsert_platform_cache(_api_df,POIZON_CACHE_PATH)
+                            _api_name=str((_api_meta or {}).get('name') or '').strip()
+                            if _api_name: upsert_product(_test_model,_test_buy,_api_name)
+                            st.success(f'✅ 연결 성공: {_test_model} · 롯데 매입가 {_test_buy:,}원 · POIZON {len(_api_df)}개 사이즈/SKU 저장')
+                            st.session_state['_lotte_v186_ready']=_test_model
+                        else:
+                            st.warning('POIZON 상품은 조회됐지만 사이즈별 통계 데이터가 없습니다.')
+                    except Exception as e:
+                        st.error(f'POIZON 자동조회 실패: {e}')
+                        st.info('POIZON API 키/서명/IP 허용 상태를 확인하거나 ② POIZON 가져오기 탭의 수동 JSON 방식을 사용할 수 있습니다.')
+                if _t2.button('📱 KREAM 입력 준비',width='stretch',key='lotte_v186_kream_prepare'):
+                    upsert_product(_test_model,_test_buy,_test_name)
+                    set_active_model(_test_model,clear_live_platform=False)
+                    st.session_state[f'current_buy_price__{_test_model}']=_test_buy
+                    st.success(f'{_test_model} 준비 완료. ③ KREAM 가져오기 탭에서 사이즈별 즉시판매가를 입력하세요.')
+            _ready=st.session_state.get('_lotte_v186_ready','')
+            if _ready:
+                _pdf=filter_platform_current(st.session_state.get('poizon_df',pd.DataFrame()),{_ready})
+                if isinstance(_pdf,pd.DataFrame) and len(_pdf):
+                    st.markdown(f'##### ✅ {_ready} POIZON 조회 결과 미리보기')
+                    _cols=[c for c in ['size','eu_size','sku_id','poizon_global_min_price','poizon_global_avg_price','poizon_30d_sales'] if c in _pdf.columns]
+                    st.dataframe(_pdf[_cols].head(20),width='stretch',hide_index=True)
+                    st.caption('이제 ③ KREAM 가져오기에서 같은 사이즈의 즉시판매가를 입력한 뒤 ④ 자동 비교로 가면 됩니다.')
+
         a1,a2=st.columns(2)
         if a1.button('➕ 선택상품을 우리 비교목록에 넣기',width='stretch',key='lotte_add_selected'):
             if len(selected)==0:
