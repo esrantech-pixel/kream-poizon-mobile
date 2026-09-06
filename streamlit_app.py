@@ -47,7 +47,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V19.2', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V19.3', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -2308,8 +2308,160 @@ def v19_1_lotte_poizon_batch(source_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V19.2')
-st.caption('Build: V19.2 · 롯데 아디다스/나이키 → POIZON 일괄 1차판정 + V18.8.4 안전엔진 유지')
+
+def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
+    """POIZON 1차 매입후보만 KREAM 자동조회 후 동일 KR사이즈로 최종 교차판정."""
+    if poizon_batch_df is None or not isinstance(poizon_batch_df, pd.DataFrame) or poizon_batch_df.empty:
+        return pd.DataFrame(), []
+
+    actionable = ['🟢🟢 강력매입', '🟢 매입추천', '🟠 1개 테스트']
+    work = poizon_batch_df.copy()
+    if '최종판정' in work.columns:
+        work = work[work['최종판정'].isin(actionable)].copy()
+    work = work.head(int(max_products)).copy()
+
+    if work.empty:
+        return pd.DataFrame(), ['POIZON 1차판정에서 KREAM 교차검증할 매입후보가 없습니다.']
+
+    poizon_cache = load_platform_cache(POIZON_CACHE_PATH)
+    result_rows, messages = [], []
+    rank = {
+        '🟢🟢 강력매입':0, '🟢 매입추천':1, '🟠 1개 테스트':2,
+        '🟡 관찰':3, '🔴 PASS':4, '⚪ 데이터부족':5
+    }
+
+    for _, src_row in work.iterrows():
+        model = str(src_row.get('품번','') or '').strip().upper()
+        brand = str(src_row.get('브랜드','') or '').strip()
+        name = str(src_row.get('상품명','') or '').strip()
+        buy = won_to_num(src_row.get('롯데매입가'))
+        url = str(src_row.get('상품URL','') or '').strip()
+
+        if not model or not buy:
+            messages.append(f'{model or "품번없음"}: 품번/롯데매입가 확인 필요')
+            continue
+
+        upsert_product(model, int(buy), name)
+        base_all = load_db()
+        base_one = base_all[
+            base_all['model'].astype(str).str.strip().str.upper() == model
+        ].copy()
+        if base_one.empty:
+            messages.append(f'{model}: 상품DB 반영 실패')
+            continue
+
+        pcur = filter_platform_current(poizon_cache, {model})
+        if pcur is None or not isinstance(pcur, pd.DataFrame):
+            pcur = pd.DataFrame()
+
+        pjudge = pcur.copy()
+        if len(pjudge):
+            if 'poizon_30d_sales' in pjudge.columns:
+                psales = pd.to_numeric(pjudge['poizon_30d_sales'], errors='coerce')
+            else:
+                psales = pd.Series([None]*len(pjudge), index=pjudge.index)
+            valid_sales = psales.fillna(0) > 0
+            for pc in ['poizon_buyer_price','poizon_avg_price']:
+                if pc in pjudge.columns:
+                    pjudge.loc[~valid_sales, pc] = None
+
+        kpid = ''
+        kstatus = ''
+        kauto = pd.DataFrame()
+        try:
+            kpid, _kinfo = kream_find_product_id(model)
+            kauto = kream_lookup_product(kpid, model=model)
+            if kauto is None or len(kauto) == 0:
+                raise RuntimeError('사이즈별 입찰/체결 데이터 없음')
+            upsert_platform_cache(kauto, KREAM_CACHE_PATH)
+            kstatus = f'✅ 자동연결 {len(kauto)}사이즈'
+        except Exception as e:
+            kstatus = '⚠️ KREAM 자동조회 실패'
+            messages.append(f'{model}: KREAM 자동조회 실패 - {str(e)[:180]}')
+            kauto = pd.DataFrame()
+
+        cmp = compute_compare(
+            base_one,
+            kream=(kauto.copy() if len(kauto) else None),
+            poizon=(pjudge.copy() if len(pjudge) else None)
+        )
+
+        if cmp is None or len(cmp) == 0:
+            result_rows.append({
+                '브랜드':brand, '품번':model, '상품명':name,
+                '롯데매입가':int(buy), '최종판정':'⚪ 데이터부족',
+                'BEST사이즈':'', '추천판매처':'데이터부족',
+                '판매기준가':None, '예상순이익':None, 'ROI(%)':None,
+                '30일판매':None, '추천수량':0,
+                'POIZON기준가':src_row.get('POIZON기준가'),
+                'POIZON30일':src_row.get('30일판매'),
+                'KREAM즉시판매':None, 'KREAM최근체결':None, 'KREAM30일':None,
+                'KREAM상태':kstatus or '미조회', 'KREAM상품ID':kpid,
+                '이유':'교차비교 가능한 동일 사이즈 데이터 없음',
+                '롯데상품':url
+            })
+            continue
+
+        cc = cmp.copy()
+        cc['_rank'] = cc['판정'].map(rank).fillna(9)
+        cc['_profit'] = pd.to_numeric(cc.get('best_profit'), errors='coerce')
+        cc['_sales'] = pd.to_numeric(cc.get('best_30d_sales'), errors='coerce')
+        cc = cc.sort_values(
+            ['_rank','_profit','_sales'],
+            ascending=[True,False,False],
+            na_position='last'
+        )
+        best = cc.iloc[0]
+
+        platform = str(best.get('best_platform') or '데이터부족')
+        sell_ref = (
+            best.get('kream_effective_price') if platform == 'KREAM'
+            else best.get('poizon_valid_buyer_price') if platform == 'POIZON'
+            else None
+        )
+
+        result_rows.append({
+            '브랜드':brand,
+            '품번':model,
+            '상품명':name,
+            '롯데매입가':int(buy),
+            '최종판정':best.get('판정'),
+            'BEST사이즈':str(best.get('size','')),
+            '추천판매처':platform,
+            '판매기준가':sell_ref,
+            '예상순이익':best.get('best_profit'),
+            'ROI(%)':best.get('best_roi'),
+            '30일판매':best.get('best_30d_sales'),
+            '추천수량':int(best.get('추천구매수량',0) or 0),
+            '권장최대매입가':best.get('권장최대매입가'),
+            'POIZON기준가':best.get('poizon_valid_buyer_price'),
+            'POIZON30일':best.get('poizon_30d_sales'),
+            'KREAM즉시판매':best.get('kream_highest_bid'),
+            'KREAM최근체결':best.get('kream_latest_price'),
+            'KREAM30일':best.get('kream_30d_sales'),
+            'KREAM가격검사':best.get('kream_price_check'),
+            'KREAM상태':kstatus or '미조회',
+            'KREAM상품ID':kpid,
+            '이유':str(best.get('판정이유','')),
+            '롯데상품':url
+        })
+
+    out = pd.DataFrame(result_rows)
+    if len(out):
+        out['_rank'] = out['최종판정'].map(rank).fillna(9)
+        out['_profit'] = pd.to_numeric(out.get('예상순이익'), errors='coerce')
+        out['_sales'] = pd.to_numeric(out.get('30일판매'), errors='coerce')
+        out = out.sort_values(
+            ['_rank','_profit','_sales'],
+            ascending=[True,False,False],
+            na_position='last'
+        ).drop(columns=['_rank','_profit','_sales']).reset_index(drop=True)
+
+    return out, messages
+
+
+st.title('KREAM · POIZON · COUPANG 소싱 V19.3')
+st.caption('Build: V19.3 · 롯데 → POIZON 1차판정 → KREAM 자동 교차검증 + V19.2 안전판정 유지')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2460,7 +2612,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V19.2')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V19.3')
     st.caption('아디다스·나이키 후보를 수집한 뒤 품번별 POIZON 공식 API를 일괄 조회해 1차 소싱 후보를 자동 판정합니다. KREAM·쿠팡은 다음 단계에서 BEST 판매처 교차비교로 확장합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -2592,7 +2744,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
 
-        st.markdown('#### 🚀 V19.2 롯데 후보 → POIZON 일괄 1차판정')
+        st.markdown('#### 🚀 V19.3 롯데 후보 → POIZON 1차판정')
         st.caption('롯데에서 잡힌 아디다스·나이키 품번을 POIZON 공식 API로 순차 조회해 실제 판매량이 있는 가격만으로 소싱 가능성을 판정합니다.')
         bc1,bc2=st.columns([1,3])
         _batch_n=bc1.number_input(
@@ -2618,6 +2770,8 @@ with tl:
                     _bout,_bmsg=v19_1_lotte_poizon_batch(_src,max_products=int(_batch_n))
                 st.session_state['v191_lotte_batch_result']=_bout
                 st.session_state['v191_lotte_batch_messages']=_bmsg
+                st.session_state.pop('v193_kream_cross_result', None)
+                st.session_state.pop('v193_kream_cross_messages', None)
 
         _bout=st.session_state.get('v191_lotte_batch_result',pd.DataFrame())
         if isinstance(_bout,pd.DataFrame) and len(_bout):
@@ -2645,6 +2799,77 @@ with tl:
             else:
                 st.warning('이번 검사 상품에서는 POIZON 기준 매입후보가 없습니다.')
 
+            st.markdown('#### 🔁 V19.3 POIZON 매입후보 → KREAM 자동 교차검증')
+            st.caption(
+                'POIZON 1차판정에서 살아남은 상품만 KREAM에서 정확 품번으로 자동 매칭합니다. '
+                '같은 KR 사이즈끼리 즉시판매가·최근체결가·30일 판매량을 비교해 최종 BEST 판매처를 고릅니다.'
+            )
+
+            if len(_buyable):
+                _cross_count = min(len(_buyable), 10)
+                if st.button(
+                    f'🔎 매입후보 {_cross_count}개 KREAM 자동 교차검증',
+                    type='primary', width='stretch', key='v193_kream_cross_run'
+                ):
+                    with st.spinner(f'KREAM에서 POIZON 매입후보 {_cross_count}개를 교차검증 중...'):
+                        _xout, _xmsg = v19_3_kream_cross_batch(_buyable, max_products=_cross_count)
+                    st.session_state['v193_kream_cross_result'] = _xout
+                    st.session_state['v193_kream_cross_messages'] = _xmsg
+            else:
+                st.info('POIZON 매입후보가 생기면 KREAM 자동 교차검증 버튼이 활성화됩니다.')
+
+            _xout = st.session_state.get('v193_kream_cross_result', pd.DataFrame())
+            if isinstance(_xout, pd.DataFrame) and len(_xout):
+                _xaction = _xout[_xout['최종판정'].isin(
+                    ['🟢🟢 강력매입','🟢 매입추천','🟠 1개 테스트']
+                )]
+                st.markdown(
+                    f'##### 🏁 POIZON + KREAM 최종 교차결과 · 전체 {len(_xout)}개 / 최종매입후보 {len(_xaction)}개'
+                )
+                _display_cols = [c for c in [
+                    '브랜드','품번','상품명','롯데매입가','최종판정','BEST사이즈',
+                    '추천판매처','판매기준가','예상순이익','ROI(%)','30일판매','추천수량',
+                    'POIZON기준가','POIZON30일',
+                    'KREAM즉시판매','KREAM최근체결','KREAM30일','KREAM상태',
+                    '권장최대매입가','이유','롯데상품'
+                ] if c in _xout.columns]
+                st.dataframe(
+                    _xout[_display_cols],
+                    width='stretch', hide_index=True,
+                    column_config={
+                        '롯데매입가':st.column_config.NumberColumn(format='%,d원'),
+                        '판매기준가':st.column_config.NumberColumn(format='%,d원'),
+                        '예상순이익':st.column_config.NumberColumn(format='%,d원'),
+                        'ROI(%)':st.column_config.NumberColumn(format='%.1f%%'),
+                        '30일판매':st.column_config.NumberColumn(format='%d건'),
+                        'POIZON기준가':st.column_config.NumberColumn(format='%,d원'),
+                        'POIZON30일':st.column_config.NumberColumn(format='%d건'),
+                        'KREAM즉시판매':st.column_config.NumberColumn(format='%,d원'),
+                        'KREAM최근체결':st.column_config.NumberColumn(format='%,d원'),
+                        'KREAM30일':st.column_config.NumberColumn(format='%d건'),
+                        '권장최대매입가':st.column_config.NumberColumn(format='%,d원'),
+                        '롯데상품':st.column_config.LinkColumn('롯데상품',display_text='열기'),
+                    }
+                )
+                if len(_xaction):
+                    _z = _xaction.iloc[0]
+                    _sales_txt = int(float(_z['30일판매'])) if pd.notna(_z.get('30일판매')) else 0
+                    st.success(
+                        f"🏆 최종 1순위: {_z['브랜드']} {_z['품번']} / KR {_z['BEST사이즈']} / "
+                        f"{_z['최종판정']} / BEST 판매처 {_z['추천판매처']} / "
+                        f"예상순익 {float(_z['예상순이익']):,.0f}원 / "
+                        f"ROI {float(_z['ROI(%)']):.1f}% / 30일 {_sales_txt}건 / "
+                        f"추천 {_z['추천수량']}개"
+                    )
+                else:
+                    st.warning('POIZON+KREAM 교차검증 후에는 현재 매입 추천 상품이 없습니다.')
+
+            _xmsgs = st.session_state.get('v193_kream_cross_messages', []) or []
+            if _xmsgs:
+                with st.expander('KREAM 교차검증 확인 메시지'):
+                    for _m in _xmsgs:
+                        st.caption(str(_m))
+
         _bmsgs=st.session_state.get('v191_lotte_batch_messages',[]) or []
         if _bmsgs:
             with st.expander('일괄조회 확인 메시지'):
@@ -2652,8 +2877,8 @@ with tl:
                     st.caption(str(_m))
 
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 상세 확인 · V19.2')
-        st.caption('후보 1개를 골라 롯데 매입가를 고정하고 POIZON 공식 API까지 바로 연결합니다. KREAM은 다음 탭에서 휴대폰 즉시판매가만 입력하면 자동비교가 완성됩니다.')
+        st.markdown('#### 🧪 1개 상품 상세 확인 · V19.3')
+        st.caption('후보 1개를 골라 POIZON 공식 API로 상세검증하고, 아래 KREAM 자동 교차검증으로 동일 품번·동일 KR사이즈를 다시 확인합니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
             _default_idx=_test_models.index('JQ9826') if 'JQ9826' in _test_models else 0
@@ -2765,7 +2990,7 @@ with tl:
                             else:
                                 st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 판매량 없는 POIZON 가격은 수익 계산에서 제외했습니다.')
 
-                    st.markdown('##### 🔁 V18.8.4 KREAM 자동 교차검증')
+                    st.markdown('##### 🔁 V19.3 KREAM 자동 교차검증')
                     st.caption('같은 품번을 KREAM에서 자동 매칭해 즉시판매가(최고 매입입찰)·30일 체결을 가져오고 POIZON과 같은 사이즈로 비교합니다.')
                     if st.button('🔎 KREAM 자동조회 + POIZON 교차비교', type='primary', width='stretch', key='lotte_v188_kream_auto'):
                         try:
