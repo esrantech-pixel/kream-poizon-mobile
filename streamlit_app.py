@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.8.1', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.8.2', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -559,30 +559,76 @@ def canonicalize_platform_models(df, base, platform):
     d['model'] = d['model'].map(lambda x: mapping.get(x, x))
     return d
 
+
+def _norm_model_key(v):
+    """Normalize model/style code for exact cross-platform matching."""
+    s = _clean_model(v).upper()
+    return re.sub(r'\s+', '', s)
+
+def _norm_kr_size_key(v):
+    """Normalize KR size values such as 265, 265.0, ' 265 ' to the same exact key."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ''
+    s = str(v).strip()
+    if not s or s.lower() == 'nan':
+        return ''
+    # EU-only rows must never accidentally match KR rows.
+    if s.upper().startswith('EU'):
+        return s.upper().replace(' ', '')
+    m = re.fullmatch(r'(\d+(?:\.0+)?)', s)
+    if m:
+        try:
+            n = float(m.group(1))
+            return str(int(n)) if n.is_integer() else ('%g' % n)
+        except Exception:
+            pass
+    return re.sub(r'\s+', '', s).upper()
+
+def _kream_price_sanity(instant_sell, latest_trade):
+    """Return (is_sane, reason).
+
+    A very large gap between the entered green 'instant sell' price and a recent
+    trade usually means KREAM was still on 'all options' or the wrong size.
+    We do not use such a price for an automatic buy recommendation.
+    """
+    sell = won_to_num(instant_sell)
+    latest = won_to_num(latest_trade)
+    if sell is None or sell <= 0:
+        return False, 'KREAM 즉시판매가 없음'
+    if latest is None or latest <= 0:
+        return True, '최근체결가 미입력'
+    gap = abs(sell - latest) / latest
+    if gap > 0.30:
+        return False, f'즉시판매가와 최근체결가 차이 {gap*100:.1f}% → 사이즈/옵션 재확인'
+    return True, '가격 범위 정상'
+
 def compute_compare(base, kream=None, poizon=None):
-    """Compare by exact model+size keys and avoid accidental cross-size cartesian merges."""
+    """V18.8.2 exact model+KR-size comparison with safety guards."""
     base = base.copy()
-    base['model'] = base['model'].astype(str)
+    base['model'] = base['model'].astype(str).map(_norm_model_key)
     base['buy_price_num'] = base['buy_price'].map(won_to_num)
 
-    frames = []
-
-    # V10.2: 등록 상품별 KREAM/POIZON 별칭을 canonical 모델로 변환합니다.
+    # Map aliases to canonical model first.
     kream = canonicalize_platform_models(kream, base, 'KREAM') if kream is not None else kream
     poizon = canonicalize_platform_models(poizon, base, 'POIZON') if poizon is not None else poizon
 
-    # Start from exact canonical-model + KR-size keys observed on either platform.
+    # Normalize exact merge keys.
+    if kream is not None and len(kream):
+        kream = kream.copy()
+        kream['model'] = kream['model'].astype(str).map(_norm_model_key)
+        kream['size'] = kream['size'].map(_norm_kr_size_key)
+
+    if poizon is not None and len(poizon):
+        poizon = poizon.copy()
+        poizon['model'] = poizon['model'].astype(str).map(_norm_model_key)
+        poizon['size'] = poizon['size'].map(_norm_kr_size_key)
+
+    # Start from union of exact model+size keys.
     key_parts = []
     if kream is not None and len(kream):
-        kk = kream.copy()
-        kk['model'] = kk['model'].astype(str)
-        kk['size'] = kk['size'].astype(str)
-        key_parts.append(kk[['model','size']].drop_duplicates())
+        key_parts.append(kream[['model','size']].drop_duplicates())
     if poizon is not None and len(poizon):
-        pp = poizon.copy()
-        pp['model'] = pp['model'].astype(str)
-        pp['size'] = pp['size'].astype(str)
-        key_parts.append(pp[['model','size']].drop_duplicates())
+        key_parts.append(poizon[['model','size']].drop_duplicates())
 
     if key_parts:
         keys = pd.concat(key_parts, ignore_index=True).drop_duplicates()
@@ -591,52 +637,82 @@ def compute_compare(base, kream=None, poizon=None):
         df = base.copy()
         df['size'] = ''
 
-    # Merge platform data on exact model+size only.
+    # Merge KREAM on exact normalized model+KR-size.
     if kream is not None and len(kream):
         k = kream.copy()
-        k['model'] = k['model'].astype(str)
-        k['size'] = k['size'].astype(str)
-        # one row per model+size
-        keep = [c for c in ['model','size','kream_price','kream_30d_sales','kream_latest_price'] if c in k.columns]
-        k = k[keep].drop_duplicates(subset=['model','size'])
+        keep = [c for c in [
+            'model','size','kream_price','kream_30d_sales','kream_latest_price',
+            'kream_lowest_ask','kream_highest_bid'
+        ] if c in k.columns]
+        k = k[keep].drop_duplicates(subset=['model','size'], keep='last')
         df = df.merge(k, on=['model','size'], how='left')
 
+    # Merge POIZON on exact normalized model+KR-size, preserving SKU variants.
     if poizon is not None and len(poizon):
         p = poizon.copy()
-        p['model'] = p['model'].astype(str)
-        p['size'] = p['size'].astype(str)
-
-        # Preserve multiple POIZON SKUs for the same KR size by expanding only those exact size rows.
         po_cols = [c for c in [
             'model','size','eu_size','sku_id','barcode',
             'poizon_avg_price','poizon_buyer_price',
-            'poizon_30d_sales','poizon_expected_profit','poizon_global_min_price','poizon_global_avg_price','poizon_global_30d_sales','poizon_local_30d_sales','poizon_local_avg_price','poizon_global_mom','poizon_local_mom','global_sku_id'
+            'poizon_30d_sales','poizon_expected_profit',
+            'poizon_global_min_price','poizon_global_avg_price',
+            'poizon_global_30d_sales','poizon_local_30d_sales',
+            'poizon_local_avg_price','poizon_global_mom','poizon_local_mom',
+            'global_sku_id'
         ] if c in p.columns]
         p = p[po_cols]
-
-        # Remove the placeholder row for each model+size before merging POIZON variants,
-        # then left-expand that exact size only.
         df = df.merge(p, on=['model','size'], how='left')
 
     s = st.session_state.settings
 
+    # ---------------- KREAM safety ----------------
     if 'kream_price' in df.columns:
-        df['kream_net'] = df['kream_price']*(1-s['kream_fee_rate']) - s['shipping_cost'] - s['packing_cost']
-        df['kream_profit'] = df['kream_net'] - df['buy_price_num']
-        df['kream_roi'] = df['kream_profit']/df['buy_price_num']*100
+        sane_flags, sane_reasons = [], []
+        effective_prices = []
+        for _, r in df.iterrows():
+            ok, reason = _kream_price_sanity(
+                r.get('kream_price'),
+                r.get('kream_latest_price')
+            )
+            sane_flags.append(bool(ok))
+            sane_reasons.append(reason)
+            effective_prices.append(
+                won_to_num(r.get('kream_price')) if ok else None
+            )
+        df['kream_price_sane'] = sane_flags
+        df['kream_price_check'] = sane_reasons
+        df['kream_effective_price'] = effective_prices
 
+        df['kream_net'] = (
+            pd.to_numeric(df['kream_effective_price'], errors='coerce')
+            * (1 - s['kream_fee_rate'])
+            - s['shipping_cost'] - s['packing_cost']
+        )
+        df['kream_profit'] = df['kream_net'] - df['buy_price_num']
+        df['kream_roi'] = df['kream_profit'] / df['buy_price_num'] * 100
+
+    # ---------------- POIZON safety ----------------
     if 'poizon_buyer_price' in df.columns:
-        payout = df.get('poizon_expected_profit')
+        psales = pd.to_numeric(df.get('poizon_30d_sales'), errors='coerce')
+        pprice = pd.to_numeric(df.get('poizon_buyer_price'), errors='coerce')
+
+        # Only prices with real 30-day sales are valid for automatic profit ranking.
+        valid = psales.notna() & (psales > 0) & pprice.notna() & (pprice > 0)
+        df['poizon_price_valid'] = valid
+        df['poizon_valid_buyer_price'] = pprice.where(valid)
+
+        payout = pd.to_numeric(df.get('poizon_expected_profit'), errors='coerce')
         if payout is None:
-            payout = df['poizon_buyer_price']*(1-s['poizon_fee_rate'])
+            payout = df['poizon_valid_buyer_price'] * (1 - s['poizon_fee_rate'])
         else:
             payout = payout.where(
-                payout.notna(),
-                df['poizon_buyer_price']*(1-s['poizon_fee_rate'])
+                payout.notna() & valid,
+                df['poizon_valid_buyer_price'] * (1 - s['poizon_fee_rate'])
             )
+            payout = payout.where(valid)
+
         df['poizon_net'] = payout - s['shipping_cost'] - s['packing_cost']
         df['poizon_profit'] = df['poizon_net'] - df['buy_price_num']
-        df['poizon_roi'] = df['poizon_profit']/df['buy_price_num']*100
+        df['poizon_roi'] = df['poizon_profit'] / df['buy_price_num'] * 100
 
     best = []
     grade = []
@@ -667,7 +743,15 @@ def compute_compare(base, kream=None, poizon=None):
             best_roi.append(None)
             best_sales.append(None)
             grade.append('⚪ 데이터부족')
-            reasons.append('비교 가능한 판매가 데이터 없음')
+            # Give a precise reason when KREAM was deliberately excluded.
+            kcheck = str(r.get('kream_price_check') or '')
+            psales = r.get('poizon_30d_sales')
+            if kcheck and '차이' in kcheck:
+                reasons.append(kcheck)
+            elif psales is None or pd.isna(psales) or float(psales or 0) <= 0:
+                reasons.append('POIZON 판매량 유효가격 없음 / KREAM 유효가격 없음')
+            else:
+                reasons.append('비교 가능한 판매가 데이터 없음')
             buy_qty.append(0)
             continue
 
@@ -681,29 +765,16 @@ def compute_compare(base, kream=None, poizon=None):
         best_roi.append(roi)
         best_sales.append(sales)
 
-        # 손실이면 바로 PASS
         if profit <= 0:
             grade.append('🔴 PASS')
             reasons.append('예상 손실')
             buy_qty.append(0)
             continue
 
-        # POIZON 판매량이 없으면 아무리 수익이 좋아도 관찰 유지
-        if platform == 'POIZON' and sales is None:
-            grade.append('🟡 관찰')
-            fail = []
-            if profit < s['target_profit']:
-                fail.append(f"순익 {profit:,.0f}원 < 기준 {s['target_profit']:,.0f}원")
-            if roi is None:
-                fail.append('ROI 데이터 없음')
-            elif roi < s['target_roi']:
-                fail.append(f"ROI {roi:.1f}% < 기준 {s['target_roi']:.1f}%")
-            fail.append('POIZON 30일 판매량 데이터 없음')
-            reasons.append(' / '.join(fail))
-            buy_qty.append(0)
-            continue
+        # Unknown/zero rotation -> never automatic buy recommendation.
+        sales_num = int(sales) if sales is not None and pd.notna(sales) else 0
+        min_sales = max(int(s['min_30d_sales']), 1)
 
-        # 수익/ROI 기준 미달이면 관찰
         fail = []
         if profit < s['target_profit']:
             fail.append(f"순익 {profit:,.0f}원 < 기준 {s['target_profit']:,.0f}원")
@@ -718,11 +789,12 @@ def compute_compare(base, kream=None, poizon=None):
             buy_qty.append(0)
             continue
 
-        # 여기부터 수익/ROI 기준은 통과
-        min_sales = max(int(s['min_30d_sales']), 1)
-        sales_num = int(sales) if sales is not None else 0
+        if sales_num <= 0:
+            grade.append('🟡 관찰')
+            reasons.append(f'{platform} 수익성은 확인됐으나 최근 30일 판매량 미확인')
+            buy_qty.append(0)
+            continue
 
-        # 강력매입: 마진이 크고 회전도 확인된 경우
         strong_profit = profit >= s['target_profit'] * 1.5
         strong_roi = roi is not None and roi >= max(s['target_roi'] + 20, 40)
         strong_sales = sales_num >= max(min_sales + 1, 3)
@@ -730,14 +802,12 @@ def compute_compare(base, kream=None, poizon=None):
         if strong_profit and strong_roi and strong_sales:
             grade.append('🟢🟢 강력매입')
             reasons.append('고수익·고ROI·회전 모두 충족')
-            # 최근 판매량의 절반 수준으로 보수적 재고 제안, 최대 5개
             qty = max(2, min(5, int(math.ceil(sales_num / 2))))
             buy_qty.append(qty)
         elif sales_num >= min_sales:
             grade.append('🟢 매입추천')
             reasons.append('수익·ROI·회전 기준 충족')
-            qty = 2 if sales_num >= 4 else 1
-            buy_qty.append(qty)
+            buy_qty.append(2 if sales_num >= 4 else 1)
         elif sales_num >= 1:
             grade.append('🟠 1개 테스트')
             reasons.append(f'수익성은 충족하나 최근 30일 판매 {sales_num}건으로 회전 낮음')
@@ -755,55 +825,55 @@ def compute_compare(base, kream=None, poizon=None):
     df['판정이유'] = reasons
     df['추천구매수량'] = buy_qty
 
-    # Maximum purchase price that still satisfies current target profit + ROI.
+    # Maximum buy price only from valid executable/rotation-checked price.
     max_buy = []
     guidance = []
     for _, r in df.iterrows():
         platform = r.get('best_platform')
         mb = None
-        if platform == 'KREAM' and pd.notna(r.get('kream_price', None)):
+
+        if platform == 'KREAM' and pd.notna(r.get('kream_effective_price', None)):
             mb = calc_max_buy_price(
-                r.get('kream_price'),
+                r.get('kream_effective_price'),
                 s['kream_fee_rate'],
                 s['shipping_cost'],
                 s['packing_cost'],
                 s['target_profit'],
                 s['target_roi']
             )
-        elif platform == 'POIZON' and pd.notna(r.get('poizon_buyer_price', None)):
-            # When POIZON expected-profit/payout exists we keep the existing profit engine,
-            # but max-buy-price uses buyer-visible price and the configured estimated fee.
+        elif platform == 'POIZON' and bool(r.get('poizon_price_valid', False)):
             mb = calc_max_buy_price(
-                r.get('poizon_buyer_price'),
+                r.get('poizon_valid_buyer_price'),
                 s['poizon_fee_rate'],
                 s['shipping_cost'],
                 s['packing_cost'],
                 s['target_profit'],
                 s['target_roi']
             )
+
         max_buy.append(mb)
 
         cur = r.get('buy_price_num')
-        sales = r.get('best_30d_sales')
         if mb is None or pd.isna(mb):
-            guidance.append('가격 데이터 확인')
+            kcheck = str(r.get('kream_price_check') or '')
+            if kcheck and '차이' in kcheck:
+                guidance.append('KREAM 옵션/사이즈 가격 재확인')
+            elif not bool(r.get('poizon_price_valid', False)):
+                guidance.append('POIZON 판매량 있는 가격 확인')
+            else:
+                guidance.append('가격 데이터 확인')
         elif cur is not None and pd.notna(cur) and cur > mb:
             guidance.append(f'현재 매입가가 권장 상한보다 {cur-mb:,.0f}원 높음')
-        elif sales is None or pd.isna(sales):
-            guidance.append('수익성은 확인됨 · 판매량 확인 필요')
         elif r.get('추천구매수량', 0) == 1:
             guidance.append('1개 테스트 권장')
         elif r.get('추천구매수량', 0) >= 2:
             guidance.append(f"추천 {int(r.get('추천구매수량', 0))}개 · 분할매입")
-        elif sales is None or pd.isna(sales):
-            guidance.append('수익성은 확인됨 · 판매량 확인 필요')
         else:
             guidance.append('관찰 유지')
 
     df['권장최대매입가'] = max_buy
     df['매입가이드'] = guidance
     return df
-
 
 def load_discovery_db():
     cols = [
@@ -2047,8 +2117,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.8.1')
-st.caption('Build: V18.8.1 · POIZON/KREAM 위젯 상태 충돌 수정 + 유효 판매량 기반 즉시 매입판정 + KREAM 교차검증')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.8.2')
+st.caption('Build: V18.8.2 · KR사이즈 정확매칭 + KREAM 가격오입력 안전검사 + POIZON 판매량 유효가격 판정')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2331,7 +2401,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.8.1')
+        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.8.2')
         st.caption('후보 1개를 골라 롯데 매입가를 고정하고 POIZON 공식 API까지 바로 연결합니다. KREAM은 다음 탭에서 휴대폰 즉시판매가만 입력하면 자동비교가 완성됩니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
@@ -2396,7 +2466,7 @@ with tl:
                     if len(_base_one):
                         _cmp=compute_compare(_base_one,kream=None,poizon=_pdf_judge.copy())
                         if isinstance(_cmp,pd.DataFrame) and len(_cmp):
-                            st.markdown('##### 🎯 V18.8.1 POIZON 유효가격 매입판정')
+                            st.markdown('##### 🎯 V18.8.2 POIZON 유효가격 매입판정')
                             st.caption('롯데 매입가와 POIZON 공식 가격·30일 판매량만으로 1차 판정합니다. KREAM은 다음 단계에서 교차검증합니다.')
                             _rows=[]
                             for _,_r in _cmp.iterrows():
@@ -2444,7 +2514,7 @@ with tl:
                             else:
                                 st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 판매량 없는 POIZON 가격은 수익 계산에서 제외했습니다.')
 
-                    st.markdown('##### 🔁 V18.8.1 KREAM 자동 교차검증')
+                    st.markdown('##### 🔁 V18.8.2 KREAM 자동 교차검증')
                     st.caption('같은 품번을 KREAM에서 자동 매칭해 즉시판매가(최고 매입입찰)·30일 체결을 가져오고 POIZON과 같은 사이즈로 비교합니다.')
                     if st.button('🔎 KREAM 자동조회 + POIZON 교차비교', type='primary', width='stretch', key='lotte_v188_kream_auto'):
                         try:
@@ -2899,7 +2969,7 @@ with t3:
                 'kream_lowest_ask':float(_instant_buy) if _instant_buy else None,
                 'kream_latest_price':float(_latest_trade) if _latest_trade else None,
                 'kream_recent_median':float(_latest_trade) if _latest_trade else None,
-                'kream_30d_sales':int(_sales30 or 0),
+                'kream_30d_sales':int(_sales30) if int(_sales30 or 0) > 0 else None,
                 'kream_bid_qty':None,
                 'kream_ask_qty':None,
             }])
@@ -2993,7 +3063,12 @@ with t4:
 
         rank_map={'🟢🟢 강력매입':0,'🟢 매입추천':1,'🟠 1개 테스트':2,'🟡 관찰':3,'🔴 PASS':4,'⚪ 데이터부족':5}
         result['_rank']=result['판정'].map(rank_map).fillna(9)
-        result=result.sort_values(['_rank','best_profit'],ascending=[True,False],na_position='last').drop(columns=['_rank'])
+        result['_has_kream'] = result.get('kream_price', pd.Series([None]*len(result))).notna().astype(int)
+        result=result.sort_values(
+            ['_rank','_has_kream','best_profit'],
+            ascending=[True,False,False],
+            na_position='last'
+        ).drop(columns=['_rank','_has_kream'])
 
         strong_n=int((result['판정']=='🟢🟢 강력매입').sum())
         rec_n=int((result['판정']=='🟢 매입추천').sum())
@@ -3019,7 +3094,7 @@ with t4:
             '판정','판정이유','매입가이드','추천구매수량','model','size','eu_size','sku_id',
             'buy_price_num','권장최대매입가',
             'best_platform','best_profit','best_roi','best_30d_sales',
-            'kream_price','kream_30d_sales',
+            'kream_price','kream_latest_price','kream_30d_sales','kream_price_check',
             'poizon_avg_price','poizon_buyer_price','poizon_30d_sales'
         ]
         compact_cols=[c for c in compact_cols if c in result.columns]
@@ -3040,13 +3115,27 @@ with t4:
             'best_profit':'최고예상순익',
             'best_roi':'최고ROI(%)',
             'best_30d_sales':'추천처30일판매',
-            'kream_price':'KREAM가격',
+            'kream_price':'KREAM즉시판매가',
+            'kream_latest_price':'KREAM최근체결가',
             'kream_30d_sales':'KREAM30일판매',
+            'kream_price_check':'KREAM가격검사',
             'poizon_avg_price':'POIZON평균가',
             'poizon_buyer_price':'POIZON구매자노출가',
             'poizon_30d_sales':'POIZON30일판매'
         }
         compact=compact.rename(columns=rename_map)
+
+        _kmatch = result[result.get('kream_price', pd.Series([None]*len(result))).notna()].copy()
+        if len(_kmatch):
+            _m = _kmatch.iloc[0]
+            st.success(
+                f"✅ KREAM 정확매칭 확인: {_m.get('model','')} / KR {_m.get('size','')} · "
+                f"즉시판매가 {(won_to_num(_m.get('kream_price')) or 0):,.0f}원 · "
+                f"최근체결가 {(won_to_num(_m.get('kream_latest_price')) or 0):,.0f}원 · "
+                f"{_m.get('kream_price_check','')}"
+            )
+        elif len(k):
+            st.error('KREAM 저장 행은 있으나 POIZON과 같은 모델+KR사이즈로 매칭되지 않았습니다.')
 
         st.markdown('### 한눈에 보기')
         st.dataframe(
@@ -3058,7 +3147,8 @@ with t4:
                 '권장최대매입가': st.column_config.NumberColumn(format='%,.0f원'),
                 '최고예상순익': st.column_config.NumberColumn(format='%,.0f원'),
                 '최고ROI(%)': st.column_config.NumberColumn(format='%.1f%%'),
-                'KREAM가격': st.column_config.NumberColumn(format='%,.0f원'),
+                'KREAM즉시판매가': st.column_config.NumberColumn(format='%,.0f원'),
+                'KREAM최근체결가': st.column_config.NumberColumn(format='%,.0f원'),
                 'POIZON평균가': st.column_config.NumberColumn(format='%,.0f원'),
                 'POIZON구매자노출가': st.column_config.NumberColumn(format='%,.0f원'),
             }
