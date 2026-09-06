@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.8.2', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.8.3', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -700,15 +700,21 @@ def compute_compare(base, kream=None, poizon=None):
         df['poizon_price_valid'] = valid
         df['poizon_valid_buyer_price'] = pprice.where(valid)
 
-        payout = pd.to_numeric(df.get('poizon_expected_profit'), errors='coerce')
-        if payout is None:
-            payout = df['poizon_valid_buyer_price'] * (1 - s['poizon_fee_rate'])
+        # Always build payout as an index-aligned Series.
+        # df.get(...) can return None/scalar in some shapes, which caused
+        # AttributeError on .where() in V18.8.2.
+        if 'poizon_expected_profit' in df.columns:
+            payout = pd.to_numeric(df['poizon_expected_profit'], errors='coerce')
         else:
-            payout = payout.where(
-                payout.notna() & valid,
-                df['poizon_valid_buyer_price'] * (1 - s['poizon_fee_rate'])
-            )
-            payout = payout.where(valid)
+            payout = pd.Series([float('nan')] * len(df), index=df.index, dtype='float64')
+
+        fallback_payout = (
+            pd.to_numeric(df['poizon_valid_buyer_price'], errors='coerce')
+            * (1 - s['poizon_fee_rate'])
+        )
+
+        payout = payout.where(payout.notna() & valid, fallback_payout)
+        payout = payout.where(valid)
 
         df['poizon_net'] = payout - s['shipping_cost'] - s['packing_cost']
         df['poizon_profit'] = df['poizon_net'] - df['buy_price_num']
@@ -2117,8 +2123,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.8.2')
-st.caption('Build: V18.8.2 · KR사이즈 정확매칭 + KREAM 가격오입력 안전검사 + POIZON 판매량 유효가격 판정')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.8.3')
+st.caption('Build: V18.8.3 · POIZON payout Series 안전처리 + KR사이즈 정확매칭 + KREAM 가격 안전검사')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2401,7 +2407,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.8.2')
+        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.8.3')
         st.caption('후보 1개를 골라 롯데 매입가를 고정하고 POIZON 공식 API까지 바로 연결합니다. KREAM은 다음 탭에서 휴대폰 즉시판매가만 입력하면 자동비교가 완성됩니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
@@ -2466,7 +2472,7 @@ with tl:
                     if len(_base_one):
                         _cmp=compute_compare(_base_one,kream=None,poizon=_pdf_judge.copy())
                         if isinstance(_cmp,pd.DataFrame) and len(_cmp):
-                            st.markdown('##### 🎯 V18.8.2 POIZON 유효가격 매입판정')
+                            st.markdown('##### 🎯 V18.8.3 POIZON 유효가격 매입판정')
                             st.caption('롯데 매입가와 POIZON 공식 가격·30일 판매량만으로 1차 판정합니다. KREAM은 다음 단계에서 교차검증합니다.')
                             _rows=[]
                             for _,_r in _cmp.iterrows():
@@ -2514,7 +2520,7 @@ with tl:
                             else:
                                 st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 판매량 없는 POIZON 가격은 수익 계산에서 제외했습니다.')
 
-                    st.markdown('##### 🔁 V18.8.2 KREAM 자동 교차검증')
+                    st.markdown('##### 🔁 V18.8.3 KREAM 자동 교차검증')
                     st.caption('같은 품번을 KREAM에서 자동 매칭해 즉시판매가(최고 매입입찰)·30일 체결을 가져오고 POIZON과 같은 사이즈로 비교합니다.')
                     if st.button('🔎 KREAM 자동조회 + POIZON 교차비교', type='primary', width='stretch', key='lotte_v188_kream_auto'):
                         try:
