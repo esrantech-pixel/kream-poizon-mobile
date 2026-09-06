@@ -47,7 +47,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V19.1', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V19.2', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -810,10 +810,11 @@ def compute_compare(base, kream=None, poizon=None):
         best_roi.append(roi)
         best_sales.append(sales)
 
-        # V18.8.4 실전 판정 기준
-        # 강력매입: 순익 >= 20,000원 AND ROI >= 25%
-        # 매입추천: 순익 >= 10,000원 AND ROI >= 20%
-        # 관찰:     순익 >= 5,000원  AND ROI >= 15%
+        # V19.2 실전 판정 기준 — 수익성 + 실제 30일 회전율
+        # 강력매입: 순익 >= 20,000원 AND ROI >= 20% AND 30일판매 >= 10건 -> 2개
+        # 매입추천: 순익 >= 10,000원 AND ROI >= 15% AND 30일판매 >= 5건 -> 1개
+        # 1개 테스트: 순익 >= 10,000원 AND ROI >= 15% AND 30일판매 1~4건 -> 1개
+        # 관찰: 순익 >= 5,000원 AND ROI >= 10% (위 매입조건 미충족) -> 0개
         # 그 미만은 PASS
         if profit <= 0:
             grade.append('🔴 PASS')
@@ -830,17 +831,15 @@ def compute_compare(base, kream=None, poizon=None):
             buy_qty.append(0)
             continue
 
-        # 수익성 자체가 부족하면 회전율과 관계없이 PASS
-        if profit < 5000 or roi_num < 15:
+        if profit < 5000 or roi_num < 10:
             grade.append('🔴 PASS')
             reasons.append(
                 f'수익성 미달 · 순익 {profit:,.0f}원 / ROI {roi_num:.1f}% '
-                f'(최소 5,000원·15%)'
+                f'(최소 5,000원·10%)'
             )
             buy_qty.append(0)
             continue
 
-        # 판매량 미확인은 자동매입 금지
         if sales_num <= 0:
             grade.append('🟡 관찰')
             reasons.append(
@@ -850,31 +849,33 @@ def compute_compare(base, kream=None, poizon=None):
             buy_qty.append(0)
             continue
 
-        if profit >= 20000 and roi_num >= 25:
+        if profit >= 20000 and roi_num >= 20 and sales_num >= 10:
             grade.append('🟢🟢 강력매입')
             reasons.append(
                 f'강력 기준 충족 · 순익 {profit:,.0f}원 / ROI {roi_num:.1f}% / '
                 f'30일판매 {sales_num}건'
             )
-            qty = max(2, min(5, int(math.ceil(sales_num / 2))))
-            buy_qty.append(qty)
-        elif profit >= 10000 and roi_num >= 20:
+            buy_qty.append(2)
+        elif profit >= 10000 and roi_num >= 15 and sales_num >= 5:
             grade.append('🟢 매입추천')
             reasons.append(
                 f'매입 기준 충족 · 순익 {profit:,.0f}원 / ROI {roi_num:.1f}% / '
                 f'30일판매 {sales_num}건'
             )
-            buy_qty.append(2 if sales_num >= 4 else 1)
-        elif profit >= 5000 and roi_num >= 15:
+            buy_qty.append(1)
+        elif profit >= 10000 and roi_num >= 15 and 1 <= sales_num <= 4:
+            grade.append('🟠 1개 테스트')
+            reasons.append(
+                f'수익성 우수·판매량 소량 · 순익 {profit:,.0f}원 / ROI {roi_num:.1f}% / '
+                f'30일판매 {sales_num}건 → 1개 테스트'
+            )
+            buy_qty.append(1)
+        else:
             grade.append('🟡 관찰')
             reasons.append(
                 f'관찰 기준 · 순익 {profit:,.0f}원 / ROI {roi_num:.1f}% / '
                 f'30일판매 {sales_num}건'
             )
-            buy_qty.append(0)
-        else:
-            grade.append('🔴 PASS')
-            reasons.append('실전 수익 기준 미달')
             buy_qty.append(0)
 
     df['best_platform'] = best
@@ -2307,8 +2308,8 @@ def v19_1_lotte_poizon_batch(source_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V19.1')
-st.caption('Build: V19.1 · 롯데 아디다스/나이키 → POIZON 일괄 1차판정 + V18.8.4 안전엔진 유지')
+st.title('KREAM · POIZON · COUPANG 소싱 V19.2')
+st.caption('Build: V19.2 · 롯데 아디다스/나이키 → POIZON 일괄 1차판정 + V18.8.4 안전엔진 유지')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2459,7 +2460,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V19.1')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V19.2')
     st.caption('아디다스·나이키 후보를 수집한 뒤 품번별 POIZON 공식 API를 일괄 조회해 1차 소싱 후보를 자동 판정합니다. KREAM·쿠팡은 다음 단계에서 BEST 판매처 교차비교로 확장합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -2591,7 +2592,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
 
-        st.markdown('#### 🚀 V19.1 롯데 후보 → POIZON 일괄 1차판정')
+        st.markdown('#### 🚀 V19.2 롯데 후보 → POIZON 일괄 1차판정')
         st.caption('롯데에서 잡힌 아디다스·나이키 품번을 POIZON 공식 API로 순차 조회해 실제 판매량이 있는 가격만으로 소싱 가능성을 판정합니다.')
         bc1,bc2=st.columns([1,3])
         _batch_n=bc1.number_input(
@@ -2651,7 +2652,7 @@ with tl:
                     st.caption(str(_m))
 
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 상세 확인 · V19.1')
+        st.markdown('#### 🧪 1개 상품 상세 확인 · V19.2')
         st.caption('후보 1개를 골라 롯데 매입가를 고정하고 POIZON 공식 API까지 바로 연결합니다. KREAM은 다음 탭에서 휴대폰 즉시판매가만 입력하면 자동비교가 완성됩니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
