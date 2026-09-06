@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.4 NET PROFIT TELEGRAM', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.5 REAL NET PROFIT', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -57,9 +57,11 @@ DISCOVERY_PATH = DATA_DIR / 'poizon_discovery.csv'
 
 DEFAULT_SETTINGS = {
     'kream_fee_rate': 0.035,
-    'poizon_fee_rate': 0.05,
+    'poizon_fee_rate': 0.10,
     'shipping_cost': 7000,
     'packing_cost': 1000,
+    'kream_fixed_cost': 0,
+    'poizon_fixed_cost': 0,
     'other_cost': 0,  # 관세/검수/추가운영비 등 사용자가 직접 입력
     'target_profit': 15000,
     'target_roi': 20.0,
@@ -615,23 +617,36 @@ def compute_compare(base, kream=None, poizon=None):
 
     if 'kream_price' in df.columns:
         df['kream_fee_amount'] = df['kream_price'] * s['kream_fee_rate']
-        df['kream_net'] = df['kream_price'] - df['kream_fee_amount'] - s['shipping_cost'] - s['packing_cost'] - s.get('other_cost', 0)
+        df['kream_fixed_cost'] = float(s.get('kream_fixed_cost', 0))
+        df['kream_net'] = (
+            df['kream_price']
+            - df['kream_fee_amount']
+            - df['kream_fixed_cost']
+            - s['shipping_cost']
+            - s['packing_cost']
+            - s.get('other_cost', 0)
+        )
         df['kream_profit'] = df['kream_net'] - df['buy_price_num']
         df['kream_roi'] = df['kream_profit']/df['buy_price_num']*100
 
     if 'poizon_buyer_price' in df.columns:
-        payout = df.get('poizon_expected_profit')
-        if payout is None:
-            payout = df['poizon_buyer_price']*(1-s['poizon_fee_rate'])
-        else:
-            payout = payout.where(
-                payout.notna(),
-                df['poizon_buyer_price']*(1-s['poizon_fee_rate'])
-            )
-        # POIZON의 '예상 수익' 값이 있으면 플랫폼 정산예정액으로 우선 사용합니다.
-        # 없을 때만 구매자 노출가에서 추정 수수료를 차감합니다.
+        raw_payout = df.get('poizon_expected_profit')
+        if raw_payout is None:
+            raw_payout = pd.Series([None] * len(df), index=df.index, dtype='float64')
+        estimated_payout = (
+            df['poizon_buyer_price'] * (1 - s['poizon_fee_rate'])
+            - float(s.get('poizon_fixed_cost', 0))
+        )
+        payout = raw_payout.where(raw_payout.notna(), estimated_payout)
+        df['poizon_payout_used'] = payout
         df['poizon_fee_amount'] = (df['poizon_buyer_price'] - payout).clip(lower=0)
-        df['poizon_net'] = payout - s['shipping_cost'] - s['packing_cost'] - s.get('other_cost', 0)
+        df['poizon_fixed_cost'] = float(s.get('poizon_fixed_cost', 0))
+        df['poizon_net'] = (
+            payout
+            - s['shipping_cost']
+            - s['packing_cost']
+            - s.get('other_cost', 0)
+        )
         df['poizon_profit'] = df['poizon_net'] - df['buy_price_num']
         df['poizon_roi'] = df['poizon_profit']/df['buy_price_num']*100
 
@@ -763,21 +778,31 @@ def compute_compare(base, kream=None, poizon=None):
                 r.get('kream_price'),
                 s['kream_fee_rate'],
                 s['shipping_cost'],
-                s['packing_cost'] + s.get('other_cost', 0),
+                s['packing_cost'] + s.get('other_cost', 0) + s.get('kream_fixed_cost', 0),
                 s['target_profit'],
                 s['target_roi']
             )
         elif platform == 'POIZON' and pd.notna(r.get('poizon_buyer_price', None)):
-            # When POIZON expected-profit/payout exists we keep the existing profit engine,
-            # but max-buy-price uses buyer-visible price and the configured estimated fee.
-            mb = calc_max_buy_price(
-                r.get('poizon_buyer_price'),
-                s['poizon_fee_rate'],
-                s['shipping_cost'],
-                s['packing_cost'] + s.get('other_cost', 0),
-                s['target_profit'],
-                s['target_roi']
-            )
+            payout_used = r.get('poizon_payout_used', None)
+            if payout_used is not None and pd.notna(payout_used):
+                net_before_buy = (
+                    float(payout_used)
+                    - float(s['shipping_cost'])
+                    - float(s['packing_cost'])
+                    - float(s.get('other_cost', 0))
+                )
+                by_profit = net_before_buy - float(s['target_profit'])
+                by_roi = net_before_buy / (1 + float(s['target_roi'])/100.0)
+                mb = max(min(by_profit, by_roi), 0.0)
+            else:
+                mb = calc_max_buy_price(
+                    r.get('poizon_buyer_price'),
+                    s['poizon_fee_rate'],
+                    s['shipping_cost'],
+                    s['packing_cost'] + s.get('other_cost', 0) + s.get('poizon_fixed_cost', 0),
+                    s['target_profit'],
+                    s['target_roi']
+                )
         max_buy.append(mb)
 
         cur = r.get('buy_price_num')
@@ -883,7 +908,13 @@ def score_discovery(df):
 
         # 국내 소싱가까지 입력되면 실제 1족 테스트 여부를 판정한다.
         if buy is not None and pd.notna(buy) and buy > 0 and sell_ref is not None and pd.notna(sell_ref):
-            net = float(sell_ref) * (1 - float(s['poizon_fee_rate'])) - float(s['shipping_cost']) - float(s['packing_cost']) - float(s.get('other_cost', 0))
+            net = (
+                float(sell_ref) * (1 - float(s['poizon_fee_rate']))
+                - float(s.get('poizon_fixed_cost', 0))
+                - float(s['shipping_cost'])
+                - float(s['packing_cost'])
+                - float(s.get('other_cost', 0))
+            ) - float(s.get('other_cost', 0))
             profit = net - float(buy)
             roi = profit / float(buy) * 100 if buy else None
             if profit <= 0:
@@ -1586,7 +1617,7 @@ def candidate_telegram_text(df, title='⭐ KREAM·POIZON 소싱 후보'):
     return '\n'.join(lines)
 
 def field_decision_telegram_text(df, product_name='', model=''):
-    """Compact field-buying decision for Telegram: best first, then test sizes, then holds."""
+    """V17.5: Telegram field decision with itemized real-cost breakdown."""
     title = '📲 현장 역소싱 판정'
     if df is None or len(df) == 0:
         return title + '\n현재 전송할 판정 데이터가 없습니다.'
@@ -1594,40 +1625,95 @@ def field_decision_telegram_text(df, product_name='', model=''):
     d = df.copy()
     if '판정' not in d.columns:
         return title + '\n판정 열이 없습니다.'
+
     rank = {'🟢🟢 강력매입':0, '🟢 매입추천':1, '🟠 1개 테스트':2, '🟡 관찰':3, '🔴 PASS':4, '⚪ 데이터부족':5}
     d['_tg_rank'] = d['판정'].map(rank).fillna(9)
-    if '최고예상순익' in d.columns:
-        d['_tg_profit'] = pd.to_numeric(d['최고예상순익'], errors='coerce').fillna(-1)
-    else:
-        d['_tg_profit'] = -1
+    d['_tg_profit'] = pd.to_numeric(d.get('최고예상순익'), errors='coerce').fillna(-1) if '최고예상순익' in d.columns else -1
     d = d.sort_values(['_tg_rank','_tg_profit'], ascending=[True,False])
 
+    def clean(v, default='-'):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return default
+        s = str(v).strip()
+        return default if not s or s.lower() in ('none','nan','nat') else s
+
     def txt(r, c, default='-'):
-        x = r.get(c, default)
-        return default if pd.isna(x) or str(x).strip() in ('','None','nan') else str(x)
+        return clean(r.get(c, default), default)
+
+    def money(v):
+        try:
+            return f"{float(v):,.0f}원" if v is not None and pd.notna(v) else '-'
+        except Exception:
+            return '-'
+
     def won(r, c):
-        try: return f"{float(r.get(c)):,.0f}원" if pd.notna(r.get(c)) else '-'
-        except: return '-'
+        return money(r.get(c))
+
     def roi(r):
-        try: return f"{float(r.get('최고ROI(%)')):.1f}%" if pd.notna(r.get('최고ROI(%)')) else '-'
-        except: return '-'
+        try:
+            return f"{float(r.get('최고ROI(%)')):.1f}%" if pd.notna(r.get('최고ROI(%)')) else '-'
+        except Exception:
+            return '-'
+
+    product_name = clean(product_name, '')
+    if not product_name:
+        product_name = '상품명 미등록'
 
     actionable = d[d['판정'].isin(['🟢🟢 강력매입','🟢 매입추천','🟠 1개 테스트'])]
-    lines=[title, f"상품: {product_name or '-'}", f"품번: {model or txt(d.iloc[0],'모델')}"]
+    lines = [title, f"상품: {product_name}", f"품번: {model or txt(d.iloc[0],'모델')}"]
+
     if len(actionable):
         best = actionable.iloc[0]
-        lines += ['', f"{txt(best,'판정')} BEST: KR {txt(best,'KR사이즈')}",
-                  f"매입가: {won(best,'현재매입가')}",
-                  f"추천판매처: {txt(best,'추천판매처')}",
-                  f"💵 최종 예상 순이익: {won(best,'최고예상순익')} | ROI: {roi(best)}",
-                  f"30일 판매: {txt(best,'추천처30일판매')}개",
-                  f"👉 추천: {txt(best,'추천구매수량','0')}개 매입",
-                  f"💰 최대 매입가: {won(best,'권장최대매입가')}"]
+        platform = txt(best, '추천판매처', '-')
+        buy_price = best.get('현재매입가')
+        shipping = float(st.session_state.settings.get('shipping_cost', 0))
+        packing = float(st.session_state.settings.get('packing_cost', 0))
+        other = float(st.session_state.settings.get('other_cost', 0))
+
+        if platform == 'KREAM':
+            sell_price = best.get('KREAM가격')
+            platform_fee = best.get('KREAM수수료')
+            fixed_cost = best.get('KREAM고정비')
+            fee_label = 'KREAM 수수료'
+        else:
+            sell_price = best.get('POIZON구매자노출가')
+            platform_fee = best.get('POIZON플랫폼공제')
+            fixed_cost = 0
+            fee_label = 'POIZON 플랫폼 공제'
+
+        lines += [
+            '',
+            f"{txt(best,'판정')} BEST: KR {txt(best,'KR사이즈')}",
+            f"추천판매처: {platform}",
+            '',
+            '💰 비용 차감 내역',
+            f"판매 기준가: {money(sell_price)}",
+            f"상품 매입가: -{money(buy_price)}",
+            f"{fee_label}: -{money(platform_fee)}",
+        ]
+        if fixed_cost is not None and pd.notna(fixed_cost) and float(fixed_cost) > 0:
+            lines.append(f"플랫폼 고정비: -{money(fixed_cost)}")
+        lines += [
+            f"배송비: -{money(shipping)}",
+            f"포장비: -{money(packing)}",
+            f"기타비용: -{money(other)}",
+            '────────────',
+            f"💵 실제 예상 순이익: {won(best,'최고예상순익')}",
+            f"📈 실제 ROI: {roi(best)}",
+            f"🔄 30일 판매: {txt(best,'추천처30일판매')}개",
+            f"👉 추천 수량: {txt(best,'추천구매수량','0')}개",
+            f"🚨 최대 매입가: {won(best,'권장최대매입가')}",
+        ]
+
         others = actionable.iloc[1:7]
         if len(others):
             lines += ['', '🟠 추가 후보']
             for _, r in others.iterrows():
-                lines.append(f"KR {txt(r,'KR사이즈')} · {txt(r,'판정')} · 최종순익 {won(r,'최고예상순익')} · ROI {roi(r)} · {txt(r,'추천구매수량','0')}개")
+                lines.append(
+                    f"KR {txt(r,'KR사이즈')} · {txt(r,'판정')} · "
+                    f"순이익 {won(r,'최고예상순익')} · ROI {roi(r)} · "
+                    f"{txt(r,'추천구매수량','0')}개"
+                )
     else:
         lines += ['', '🔴 지금 바로 매입할 추천 사이즈 없음']
 
@@ -1635,7 +1721,13 @@ def field_decision_telegram_text(df, product_name='', model=''):
     if len(holds):
         sizes = ', '.join('KR '+txt(r,'KR사이즈') for _,r in holds.head(12).iterrows())
         lines += ['', f"⏸ 보류/관찰: {sizes}"]
-    lines += ['', f"※ 최종순익 = 판매대금 - 매입가 - 플랫폼수수료 - 배송비({st.session_state.settings['shipping_cost']:,.0f}) - 포장비({st.session_state.settings['packing_cost']:,.0f}) - 기타비용({st.session_state.settings.get('other_cost',0):,.0f})", '※ POIZON 예상수익/정산액이 제공되면 그 값을 우선 반영하며, 실제 정산액은 판매 확정 전 플랫폼에서 최종 확인']
+
+    lines += [
+        '',
+        '※ 순이익 = 판매기준가 - 플랫폼공제 - 매입가 - 배송 - 포장 - 기타비용',
+        '※ POIZON이 정산예정액을 직접 제공하면 그 값을 우선 사용합니다.',
+        '※ 실제 결제 전 판매자센터의 최신 수수료/정산액을 최종 확인하세요.'
+    ]
     return '\n'.join(lines)
 
 def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target_profit, target_roi):
@@ -1655,8 +1747,8 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V17.4 NET PROFIT TELEGRAM')
-st.caption('Build: V17.4 · 최종순익(수수료·배송·포장·기타비용 차감) · 현재 품번만 분리 비교 + POIZON 공식 API + KREAM 휴대폰 빠른입력')
+st.title('KREAM · POIZON 역소싱 V17.5 REAL NET PROFIT')
+st.caption('Build: V17.5 · 비용항목별 차감 + 텔레그램 상세 손익표 + 상품명 nan 보정 + POIZON 기본 수수료 10%')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -1666,7 +1758,9 @@ with st.sidebar:
     s['packing_cost']=st.number_input('포장비(원)',0,50000,int(s['packing_cost']),500)
     s['other_cost']=st.number_input('기타 추가비용(원)',0,200000,int(s.get('other_cost',0)),500, help='관세·검수·추가 운영비 등 실제로 더 드는 비용이 있으면 입력')
     s['kream_fee_rate']=st.number_input('KREAM 수수료율',0.0,0.5,float(s['kream_fee_rate']),0.005,format='%.3f')
-    s['poizon_fee_rate']=st.number_input('POIZON 추정 수수료율',0.0,0.5,float(s['poizon_fee_rate']),0.005,format='%.3f')
+    s['kream_fixed_cost']=st.number_input('KREAM 건당 추가 고정비(원)',0,100000,int(s.get('kream_fixed_cost',0)),500)
+    s['poizon_fee_rate']=st.number_input('POIZON 추정 수수료율',0.0,0.5,float(s['poizon_fee_rate']),0.005,format='%.3f',help='기본값 10%. 실제 판매자센터 정산률이 다르면 수정')
+    s['poizon_fixed_cost']=st.number_input('POIZON 건당 추가 고정비(원)',0,100000,int(s.get('poizon_fixed_cost',0)),500,help='정산예정액에 이미 포함된 비용이면 0원')
     s['target_profit']=st.number_input('추천 최소 순익',0,200000,int(s['target_profit']),1000)
     s['target_roi']=st.number_input('추천 최소 ROI(%)',0.0,200.0,float(s['target_roi']),1.0)
     s['min_30d_sales']=st.number_input('추천 최소 30일 판매량',0,100000,int(s['min_30d_sales']),10)
@@ -2274,8 +2368,9 @@ with t4:
             '판정','판정이유','매입가이드','추천구매수량','model','size','eu_size','sku_id',
             'buy_price_num','권장최대매입가',
             'best_platform','best_profit','best_roi','best_30d_sales',
-            'kream_price','kream_30d_sales',
-            'poizon_avg_price','poizon_buyer_price','poizon_30d_sales'
+            'kream_price','kream_30d_sales','kream_fee_amount','kream_fixed_cost',
+            'poizon_avg_price','poizon_buyer_price','poizon_30d_sales',
+            'poizon_fee_amount','poizon_fixed_cost','poizon_payout_used','poizon_expected_profit'
         ]
         compact_cols=[c for c in compact_cols if c in result.columns]
         compact=result[compact_cols].copy()
@@ -2297,9 +2392,15 @@ with t4:
             'best_30d_sales':'추천처30일판매',
             'kream_price':'KREAM가격',
             'kream_30d_sales':'KREAM30일판매',
+            'kream_fee_amount':'KREAM수수료',
+            'kream_fixed_cost':'KREAM고정비',
             'poizon_avg_price':'POIZON평균가',
             'poizon_buyer_price':'POIZON구매자노출가',
-            'poizon_30d_sales':'POIZON30일판매'
+            'poizon_30d_sales':'POIZON30일판매',
+            'poizon_fee_amount':'POIZON플랫폼공제',
+            'poizon_fixed_cost':'POIZON고정비',
+            'poizon_payout_used':'POIZON정산기준액',
+            'poizon_expected_profit':'POIZON제공정산액'
         }
         compact=compact.rename(columns=rename_map)
 
@@ -2336,9 +2437,17 @@ with t4:
 
         st.info('POIZON은 30일 판매량 데이터가 없으면 수익성이 좋아도 자동으로 🟡 관찰로 유지합니다. 실제 매입 전 POIZON 판매량/회전성은 별도로 확인하세요.')
 
-        # ===== V17.3: 현장용 원클릭 Telegram 판정 =====
-        _product_name = str(base.iloc[0].get('name','') or '').strip() if len(base) else ''
-        if st.button('📲 현장판정 텔레그램 전송', type='primary', width='stretch', key='telegram_field_decision_v173'):
+        # ===== V17.5: 현장용 원클릭 Telegram 판정 =====
+        _raw_name = base.iloc[0].get('name','') if len(base) else ''
+        _product_name = '' if pd.isna(_raw_name) or str(_raw_name).strip().lower() == 'nan' else str(_raw_name).strip()
+        if not _product_name:
+            _meta = st.session_state.get('poizon_api_meta', {}) or {}
+            _meta_name = _meta.get('name', '') if isinstance(_meta, dict) else ''
+            if _meta_name and str(_meta_name).strip().lower() != 'nan':
+                _product_name = str(_meta_name).strip()
+        if not _product_name:
+            _product_name = f'품번 {_active_canonical}'
+        if st.button('📲 현장판정 텔레그램 전송', type='primary', width='stretch', key='telegram_field_decision_v175'):
             _tg_text = field_decision_telegram_text(compact, _product_name, _active_canonical)
             ok, msg = send_telegram_message(_tg_text)
             (st.success if ok else st.error)(msg)
