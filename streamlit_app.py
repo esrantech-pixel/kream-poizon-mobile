@@ -8,7 +8,46 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.8.4', layout='wide', initial_sidebar_state='collapsed')
+# ===== V19.0 MULTI-SOURCE FRAMEWORK =====
+# 실제 자동수집은 소싱처별로 단계적으로 연결합니다.
+V19_SOURCE_STORES = {
+    "롯데ON/롯데백화점": {"enabled": True,  "brands": ["Adidas", "Nike"], "status": "1차 연결"},
+    "신세계몰":          {"enabled": False, "brands": ["Adidas", "Nike"], "status": "롯데 안정화 후"},
+    "무신사":            {"enabled": False, "brands": ["Adidas", "Nike"], "status": "2차 확장"},
+}
+V19_SELL_MARKETS = {
+    "POIZON":  {"enabled": True,  "status": "현재 연결"},
+    "KREAM":   {"enabled": True,  "status": "현재 교차검증"},
+    "COUPANG": {"enabled": False, "status": "연결 준비"},
+}
+
+def v19_normalize_source_row(source, brand="", model="", name="", gender="",
+                             retail_price=None, buy_price=None, url=""):
+    def _num(v):
+        try:
+            if v is None:
+                return None
+            return float(str(v).replace(",", "").replace("원", "").strip())
+        except Exception:
+            return None
+    retail = _num(retail_price)
+    buy = _num(buy_price)
+    discount = round((retail-buy)/retail*100, 1) if retail and buy is not None else None
+    return {
+        "소싱처": str(source or "").strip(),
+        "브랜드": str(brand or "").strip(),
+        "품번": str(model or "").strip().upper(),
+        "상품명": str(name or "").strip(),
+        "성별": str(gender or "").strip(),
+        "정상가": retail,
+        "실구매가": buy,
+        "할인율": discount,
+        "상품URL": str(url or "").strip(),
+    }
+# ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
+
+
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V19.0', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -2138,8 +2177,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.8.4')
-st.caption('Build: V18.8.4 · 실전 순이익/ROI 판정 기준 현실화 + 기존 안전검사 유지')
+st.title('KREAM · POIZON · COUPANG 소싱 V19.0')
+st.caption('Build: V19.0 · 멀티 소싱처 확장 준비 + V18.8.4 실전 판정엔진 유지')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
