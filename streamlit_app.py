@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.8', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.8.1', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -116,7 +116,14 @@ def _clean_model(v):
     return '' if s.lower() == 'nan' else s
 
 def set_active_model(model, clear_live_platform=True):
-    """Set the one product currently being investigated in the field."""
+    """Set the active product without mutating already-instantiated widget keys.
+
+    Streamlit raises StreamlitWidgetAlreadyInstantiatedError when a widget key
+    (for example pmodel/kmodel) is assigned through session_state after the
+    widget has already been rendered in the same run.  Therefore this helper
+    updates only non-widget state.  pmodel/kmodel are synchronized immediately
+    before their widgets are rendered in each tab.
+    """
     model = _clean_model(model)
     if not model:
         return
@@ -127,10 +134,6 @@ def set_active_model(model, clear_live_platform=True):
         st.session_state.pop('poizon_api_meta', None)
         st.session_state.pop('poizon_api_raw', None)
     st.session_state['_active_model'] = model
-    # V18.6: keep downstream POIZON/KREAM tabs synchronized with the active sourcing model.
-    # set_active_model is called before those widgets are rendered in this app, so this is safe.
-    st.session_state['pmodel'] = model
-    st.session_state['kmodel'] = model
 
 def resolve_active_product(base, requested_model=''):
     """Return one canonical product row plus KREAM/POIZON aliases."""
@@ -2044,8 +2047,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.8')
-st.caption('Build: V18.8 · 롯데ON 매입가 → POIZON 공식 API → 유효 판매량 기반 즉시 매입판정 + KREAM 자동 교차검증')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.8.1')
+st.caption('Build: V18.8.1 · POIZON/KREAM 위젯 상태 충돌 수정 + 유효 판매량 기반 즉시 매입판정 + KREAM 교차검증')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2164,7 +2167,6 @@ with tf:
             _saved_model = str(model_v).strip()
             upsert_product(_saved_model, int(buy_v), display_name)
             set_active_model(_saved_model, clear_live_platform=True)
-            st.session_state["pmodel"] = _saved_model
             st.success(f"저장 완료: {model_v} / {int(buy_v):,}원 · 현재 조사 품번으로 설정")
 
     q_model = str(model_v or "").strip()
@@ -2329,7 +2331,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.8')
+        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.8.1')
         st.caption('후보 1개를 골라 롯데 매입가를 고정하고 POIZON 공식 API까지 바로 연결합니다. KREAM은 다음 탭에서 휴대폰 즉시판매가만 입력하면 자동비교가 완성됩니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
@@ -2394,7 +2396,7 @@ with tl:
                     if len(_base_one):
                         _cmp=compute_compare(_base_one,kream=None,poizon=_pdf_judge.copy())
                         if isinstance(_cmp,pd.DataFrame) and len(_cmp):
-                            st.markdown('##### 🎯 V18.8 POIZON 유효가격 매입판정')
+                            st.markdown('##### 🎯 V18.8.1 POIZON 유효가격 매입판정')
                             st.caption('롯데 매입가와 POIZON 공식 가격·30일 판매량만으로 1차 판정합니다. KREAM은 다음 단계에서 교차검증합니다.')
                             _rows=[]
                             for _,_r in _cmp.iterrows():
@@ -2442,7 +2444,7 @@ with tl:
                             else:
                                 st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 판매량 없는 POIZON 가격은 수익 계산에서 제외했습니다.')
 
-                    st.markdown('##### 🔁 V18.8 KREAM 자동 교차검증')
+                    st.markdown('##### 🔁 V18.8.1 KREAM 자동 교차검증')
                     st.caption('같은 품번을 KREAM에서 자동 매칭해 즉시판매가(최고 매입입찰)·30일 체결을 가져오고 POIZON과 같은 사이즈로 비교합니다.')
                     if st.button('🔎 KREAM 자동조회 + POIZON 교차비교', type='primary', width='stretch', key='lotte_v188_kream_auto'):
                         try:
@@ -2647,9 +2649,23 @@ with t2:
 
     _base_for_poizon = load_db()
     _latest_model = str(_base_for_poizon.iloc[-1]['model']) if len(_base_for_poizon) else 'HQ2197-600'
-    if 'pmodel' not in st.session_state:
+    _active_for_poizon = _clean_model(st.session_state.get('_active_model', ''))
+
+    # Synchronize only BEFORE the pmodel widget is instantiated.
+    # This safely carries a model selected in 현장/롯데 tabs into POIZON.
+    if _active_for_poizon and st.session_state.get('_poizon_target_canonical') != _active_for_poizon:
+        st.session_state['pmodel'] = _active_for_poizon
+        st.session_state['_poizon_target_canonical'] = _active_for_poizon
+    elif 'pmodel' not in st.session_state:
         st.session_state['pmodel'] = _latest_model
+        st.session_state['_poizon_target_canonical'] = _clean_model(_latest_model)
+
     pmodel = st.text_input('POIZON 품번 / 모델번호', key='pmodel')
+
+    # Remember a user's manual edit without reassigning the widget key.
+    _pmodel_now = _clean_model(pmodel)
+    if _pmodel_now:
+        st.session_state['_poizon_target_canonical'] = _pmodel_now
 
     _existing_buy = 0
     _db_for_buy = load_db()
