@@ -1893,6 +1893,44 @@ def fetch_lotteon_search(brand='아디다스', max_items=120):
     d=d.head(int(max_items)).reset_index(drop=True)
     return d,url,f'{len(d)}개 정밀 후보 수집 · '+ ' / '.join(diagnostics)
 
+
+
+def _lotteon_fetch_raw(brand='아디다스'):
+    brand=str(brand or '').strip(); base='https://www.lotteon.com'
+    url=base+'/csearch/search/search?'+urllib.parse.urlencode({'render':'search','platform':'pc','q':brand,'mallId':'2'})
+    headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36','Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8','Accept-Language':'ko-KR,ko;q=0.9,en;q=0.7','Cache-Control':'no-cache','Pragma':'no-cache','Referer':base+'/'}
+    try:
+        r=requests.Session().get(url,headers=headers,timeout=25,allow_redirects=True)
+        r.raise_for_status()
+        return r.text or '', url, f'HTTP {r.status_code} · {len(r.text or ""):,}자'
+    except Exception as e:
+        return '', url, f'접속 실패: {e}'
+
+def _lotteon_diag_snippets(html, brand, model_query=''):
+    blob=_lotteon_deescape(html or '')
+    models=[]
+    if model_query.strip():
+        models=[model_query.strip().upper()]
+    else:
+        # adidas/nike style model candidates
+        pats=[r'\b[A-Z]{1,3}\d{4,6}\b', r'\b[A-Z]{2}\d{3,5}-?\d{0,3}\b']
+        for pat in pats:
+            for m in re.finditer(pat,blob,re.I):
+                x=m.group(0).upper()
+                if x not in models and not re.fullmatch(r'20\d{4,6}',x): models.append(x)
+                if len(models)>=25: break
+            if len(models)>=25: break
+    out=[]
+    for model in models[:25]:
+        pos=blob.upper().find(model.upper())
+        if pos<0: continue
+        start=max(0,pos-900); end=min(len(blob),pos+1800)
+        chunk=blob[start:end]
+        # compact whitespace only for display; preserve JSON keys
+        chunk=re.sub(r'\s+',' ',chunk)
+        out.append({'품번후보':model,'원본주변':chunk})
+    return out
+
 def save_lotteon_db(df):
     df.to_csv(LOTTEON_PATH,index=False,encoding='utf-8-sig')
 
@@ -1907,8 +1945,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.2')
-st.caption('Build: V18.2 · 롯데ON 가격·상품명 정밀 파싱 + 아디다스/나이키')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.3')
+st.caption('Build: V18.3 · 롯데ON 원본 데이터 진단 + 가격/상품명 정밀 파싱')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2060,7 +2098,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V18.2')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V18.3')
     st.caption('현재는 아디다스·나이키 신발 후보의 상품명/품번/가격/할인율/링크를 자동 수집합니다. 다음 단계에서 POIZON·KREAM·쿠팡 자동비교를 연결합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -2102,6 +2140,42 @@ with tl:
     q1,q2=st.columns(2)
     q1.link_button('롯데백화점 아디다스 직접 확인','https://www.lotteon.com/csearch/search/search?render=search&platform=pc&q=%EC%95%84%EB%94%94%EB%8B%A4%EC%8A%A4&mallId=2',width='stretch')
     q2.link_button('롯데백화점 나이키 직접 확인','https://www.lotteon.com/csearch/search/search?render=search&platform=pc&q=%EB%82%98%EC%9D%B4%ED%82%A4&mallId=2',width='stretch')
+
+
+    st.markdown('### 🔬 롯데ON 원본 데이터 진단')
+    st.caption('자동수집은 상품 후보를 찾지만 가격 필드가 0개로 떨어질 때, 실제 롯데ON 원문에서 품번 주변의 키/값 구조를 확인합니다. 이 결과를 보고 정확한 가격·상품명 필드를 고정합니다.')
+    dg1,dg2,dg3=st.columns([1,1,2])
+    diag_brand=dg1.selectbox('진단 브랜드',['아디다스','나이키'],key='lotte_diag_brand')
+    diag_model=dg2.text_input('특정 품번(선택)',placeholder='예: JQ9826',key='lotte_diag_model')
+    if dg3.button('🔬 원본 데이터 진단 실행',width='stretch',key='lotte_diag_run'):
+        with st.spinner('롯데ON 원본 데이터를 확인하고 있습니다...'):
+            raw,raw_url,raw_status=_lotteon_fetch_raw(diag_brand)
+        st.session_state['lotte_diag_status']=raw_status
+        st.session_state['lotte_diag_url']=raw_url
+        st.session_state['lotte_diag_rows']=_lotteon_diag_snippets(raw,diag_brand,diag_model) if raw else []
+        if raw:
+            # also expose likely price/name keys found near first chunks
+            keys=sorted(set(re.findall(r'[\"\']([A-Za-z][A-Za-z0-9_]{2,40})[\"\']\s*:', raw)))
+            likely=[k for k in keys if re.search(r'(price|prc|sale|sell|discount|dc|product|goods|item|name|disp)',k,re.I)]
+            st.session_state['lotte_diag_keys']=likely[:120]
+        else:
+            st.session_state['lotte_diag_keys']=[]
+    if st.session_state.get('lotte_diag_status'):
+        st.info('진단 상태: '+str(st.session_state['lotte_diag_status']))
+    drows=st.session_state.get('lotte_diag_rows',[]) or []
+    if drows:
+        st.success(f'품번 주변 원본 {len(drows)}건을 찾았습니다.')
+        ddf=pd.DataFrame(drows)
+        st.dataframe(ddf[['품번후보']],width='stretch',hide_index=True)
+        pick=st.selectbox('원본 확인할 품번',[x['품번후보'] for x in drows],key='lotte_diag_pick')
+        picked=next((x['원본주변'] for x in drows if x['품번후보']==pick),'')
+        st.code(picked,language='json')
+        keys=st.session_state.get('lotte_diag_keys',[]) or []
+        if keys:
+            st.caption('원문에서 발견한 가격/상품 관련 키 후보: '+', '.join(keys[:60]))
+        st.download_button('💾 진단 원문 조각 저장',data='\n\n'.join(f"[{x['품번후보']}]\n{x['원본주변']}" for x in drows),file_name=f'lotte_diag_{diag_brand}.txt',mime='text/plain',key='lotte_diag_download')
+    elif st.session_state.get('lotte_diag_status'):
+        st.warning('품번 주변 원본을 찾지 못했습니다. 특정 품번을 직접 입력해서 다시 진단해 보세요.')
 
     st.markdown('### 🧰 자동수집이 0개일 때 보조 입력')
     st.caption('롯데ON은 일부 검색결과를 브라우저에서 JavaScript로 뒤늦게 표시할 수 있습니다. 자동수집이 0개면 검색페이지에서 Ctrl+A → Ctrl+C 후 아래에 붙여넣으면 품번/가격을 바로 추출합니다.')
