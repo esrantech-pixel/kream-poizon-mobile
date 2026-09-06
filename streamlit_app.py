@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.5 REAL NET PROFIT', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.6 SAFETY MARGIN', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -65,6 +65,8 @@ DEFAULT_SETTINGS = {
     'other_cost': 0,  # 관세/검수/추가운영비 등 사용자가 직접 입력
     'target_profit': 15000,
     'target_roi': 20.0,
+    'safe_buy_roi': 25.0,
+    'safe_buy_margin': 10000,
     'min_30d_sales': 2,
 }
 
@@ -823,6 +825,92 @@ def compute_compare(base, kream=None, poizon=None):
             guidance.append('관찰 유지')
 
     df['권장최대매입가'] = max_buy
+
+    # ===== V17.6 안전마진 재판정 =====
+    safety_margin_values = []
+    new_grade = []
+    new_reason = []
+    new_qty = []
+
+    safe_roi = float(s.get('safe_buy_roi', 25.0))
+    safe_margin = float(s.get('safe_buy_margin', 10000))
+
+    for _, r in df.iterrows():
+        cur_grade = r.get('판정', '⚪ 데이터부족')
+        reason = str(r.get('판정이유', '') or '')
+        qty = int(r.get('추천구매수량', 0) or 0)
+
+        cur_buy = r.get('buy_price_num')
+        mb = r.get('권장최대매입가')
+        roi = r.get('best_roi')
+        margin = None
+        if cur_buy is not None and pd.notna(cur_buy) and mb is not None and pd.notna(mb):
+            margin = float(mb) - float(cur_buy)
+        safety_margin_values.append(margin)
+
+        if cur_grade not in ('🟢🟢 강력매입', '🟢 매입추천', '🟠 1개 테스트'):
+            new_grade.append(cur_grade)
+            new_reason.append(reason)
+            new_qty.append(qty)
+            continue
+
+        if margin is not None and margin < 0:
+            new_grade.append('🟡 관찰')
+            new_reason.append(f'안전마진 부족: 현재가가 최대매입가보다 {abs(margin):,.0f}원 높음')
+            new_qty.append(0)
+            continue
+
+        roi_val = float(roi) if roi is not None and pd.notna(roi) else None
+        roi_safe = roi_val is not None and roi_val >= safe_roi
+        margin_safe = margin is not None and margin >= safe_margin
+
+        if not roi_safe or not margin_safe:
+            details = []
+            if not roi_safe:
+                details.append(f'ROI {roi_val:.1f}% < 안전기준 {safe_roi:.1f}%' if roi_val is not None else 'ROI 확인 필요')
+            if margin is None:
+                details.append('최대매입가 안전여유 확인 필요')
+            elif not margin_safe:
+                details.append(f'매입가 여유 {margin:,.0f}원 < 안전기준 {safe_margin:,.0f}원')
+            new_grade.append('🟠 1개 테스트')
+            new_reason.append(' / '.join(details))
+            new_qty.append(1)
+            continue
+
+        new_grade.append(cur_grade)
+        new_reason.append(reason)
+        new_qty.append(qty)
+
+    df['매입안전여유'] = safety_margin_values
+    df['판정'] = new_grade
+    df['판정이유'] = new_reason
+    df['추천구매수량'] = new_qty
+
+    guidance = []
+    for _, r in df.iterrows():
+        mb = r.get('권장최대매입가')
+        cur = r.get('buy_price_num')
+        sales = r.get('best_30d_sales')
+        margin = r.get('매입안전여유')
+        grade_now = r.get('판정', '')
+
+        if mb is None or pd.isna(mb):
+            guidance.append('가격 데이터 확인')
+        elif cur is not None and pd.notna(cur) and cur > mb:
+            guidance.append(f'현재 매입가가 권장 상한보다 {cur-mb:,.0f}원 높음')
+        elif grade_now == '🟠 1개 테스트':
+            guidance.append(
+                f'1개 테스트 · 안전여유 {float(margin):,.0f}원'
+                if margin is not None and pd.notna(margin)
+                else '1개 테스트 권장'
+            )
+        elif r.get('추천구매수량', 0) >= 2:
+            guidance.append(f"추천 {int(r.get('추천구매수량', 0))}개 · 안전여유 {float(margin):,.0f}원 · 분할매입")
+        elif sales is None or pd.isna(sales):
+            guidance.append('수익성은 확인됨 · 판매량 확인 필요')
+        else:
+            guidance.append('관찰 유지')
+
     df['매입가이드'] = guidance
     return df
 
@@ -1703,6 +1791,7 @@ def field_decision_telegram_text(df, product_name='', model=''):
             f"🔄 30일 판매: {txt(best,'추천처30일판매')}개",
             f"👉 추천 수량: {txt(best,'추천구매수량','0')}개",
             f"🚨 최대 매입가: {won(best,'권장최대매입가')}",
+            f"🛡 매입가 안전여유: {won(best,'매입안전여유')}",
         ]
 
         others = actionable.iloc[1:7]
@@ -1712,7 +1801,7 @@ def field_decision_telegram_text(df, product_name='', model=''):
                 lines.append(
                     f"KR {txt(r,'KR사이즈')} · {txt(r,'판정')} · "
                     f"순이익 {won(r,'최고예상순익')} · ROI {roi(r)} · "
-                    f"{txt(r,'추천구매수량','0')}개"
+                    f"여유 {won(r,'매입안전여유')} · {txt(r,'추천구매수량','0')}개"
                 )
     else:
         lines += ['', '🔴 지금 바로 매입할 추천 사이즈 없음']
@@ -1726,6 +1815,7 @@ def field_decision_telegram_text(df, product_name='', model=''):
         '',
         '※ 순이익 = 판매기준가 - 플랫폼공제 - 매입가 - 배송 - 포장 - 기타비용',
         '※ POIZON이 정산예정액을 직접 제공하면 그 값을 우선 사용합니다.',
+        '※ 🟢 매입추천은 안전 ROI와 최대매입가 안전여유를 모두 충족해야 합니다.',
         '※ 실제 결제 전 판매자센터의 최신 수수료/정산액을 최종 확인하세요.'
     ]
     return '\n'.join(lines)
@@ -1747,8 +1837,8 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V17.5 REAL NET PROFIT')
-st.caption('Build: V17.5 · 비용항목별 차감 + 텔레그램 상세 손익표 + 상품명 nan 보정 + POIZON 기본 수수료 10%')
+st.title('KREAM · POIZON 역소싱 V17.6 SAFETY MARGIN')
+st.caption('Build: V17.6 · 실제 순이익 + 안전마진 판정 + 텔레그램 현장 경고 + POIZON 기본 수수료 10%')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -1762,7 +1852,11 @@ with st.sidebar:
     s['poizon_fee_rate']=st.number_input('POIZON 추정 수수료율',0.0,0.5,float(s['poizon_fee_rate']),0.005,format='%.3f',help='기본값 10%. 실제 판매자센터 정산률이 다르면 수정')
     s['poizon_fixed_cost']=st.number_input('POIZON 건당 추가 고정비(원)',0,100000,int(s.get('poizon_fixed_cost',0)),500,help='정산예정액에 이미 포함된 비용이면 0원')
     s['target_profit']=st.number_input('추천 최소 순익',0,200000,int(s['target_profit']),1000)
-    s['target_roi']=st.number_input('추천 최소 ROI(%)',0.0,200.0,float(s['target_roi']),1.0)
+    s['target_roi']=st.number_input('최소 허용 ROI(%)',0.0,200.0,float(s['target_roi']),1.0)
+    s['safe_buy_roi']=st.number_input('🛡 매입추천 안전 ROI(%)',0.0,200.0,float(s.get('safe_buy_roi',25.0)),1.0,
+                                      help='이 값 미만이면 수익성이 있어도 1개 테스트로 낮춥니다.')
+    s['safe_buy_margin']=st.number_input('🛡 최대매입가 안전여유(원)',0,200000,int(s.get('safe_buy_margin',10000)),1000,
+                                         help='권장 최대매입가 - 현재 매입가가 이 금액보다 작으면 1개 테스트로 낮춥니다.')
     s['min_30d_sales']=st.number_input('추천 최소 30일 판매량',0,100000,int(s['min_30d_sales']),10)
     st.info('표시 순익은 매입가 + 플랫폼 수수료(또는 POIZON 정산예정액 반영) + 배송비 + 포장비 + 기타비용을 모두 차감한 예상 최종 순이익입니다. 실제 수수료는 계정/카테고리에 따라 달라질 수 있으니 판매 확정 전 정산화면으로 최종 확인하세요.')
 
@@ -2386,6 +2480,7 @@ with t4:
             'sku_id':'POIZON SKU',
             'buy_price_num':'현재매입가',
             '권장최대매입가':'권장최대매입가',
+            '매입안전여유':'매입안전여유',
             'best_platform':'추천판매처',
             'best_profit':'최고예상순익',
             'best_roi':'최고ROI(%)',
@@ -2412,6 +2507,7 @@ with t4:
             column_config={
                 '현재매입가': st.column_config.NumberColumn(format='%,.0f원'),
                 '권장최대매입가': st.column_config.NumberColumn(format='%,.0f원'),
+                '매입안전여유': st.column_config.NumberColumn(format='%,.0f원'),
                 '최고예상순익': st.column_config.NumberColumn(format='%,.0f원'),
                 '최고ROI(%)': st.column_config.NumberColumn(format='%.1f%%'),
                 'KREAM가격': st.column_config.NumberColumn(format='%,.0f원'),
@@ -2447,7 +2543,7 @@ with t4:
                 _product_name = str(_meta_name).strip()
         if not _product_name:
             _product_name = f'품번 {_active_canonical}'
-        if st.button('📲 현장판정 텔레그램 전송', type='primary', width='stretch', key='telegram_field_decision_v175'):
+        if st.button('📲 현장판정 텔레그램 전송', type='primary', width='stretch', key='telegram_field_decision_v176'):
             _tg_text = field_decision_telegram_text(compact, _product_name, _active_canonical)
             ok, msg = send_telegram_message(_tg_text)
             (st.success if ok else st.error)(msg)
