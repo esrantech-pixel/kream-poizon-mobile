@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.2 ACTIVE MODEL', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON 역소싱 V17.3 FIELD TELEGRAM', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -1580,6 +1580,59 @@ def candidate_telegram_text(df, title='⭐ KREAM·POIZON 소싱 후보'):
     if len(df)>20: lines += ['', f'외 {len(df)-20}개는 프로그램 후보목록에서 확인']
     return '\n'.join(lines)
 
+def field_decision_telegram_text(df, product_name='', model=''):
+    """Compact field-buying decision for Telegram: best first, then test sizes, then holds."""
+    title = '📲 현장 역소싱 판정'
+    if df is None or len(df) == 0:
+        return title + '\n현재 전송할 판정 데이터가 없습니다.'
+
+    d = df.copy()
+    if '판정' not in d.columns:
+        return title + '\n판정 열이 없습니다.'
+    rank = {'🟢🟢 강력매입':0, '🟢 매입추천':1, '🟠 1개 테스트':2, '🟡 관찰':3, '🔴 PASS':4, '⚪ 데이터부족':5}
+    d['_tg_rank'] = d['판정'].map(rank).fillna(9)
+    if '최고예상순익' in d.columns:
+        d['_tg_profit'] = pd.to_numeric(d['최고예상순익'], errors='coerce').fillna(-1)
+    else:
+        d['_tg_profit'] = -1
+    d = d.sort_values(['_tg_rank','_tg_profit'], ascending=[True,False])
+
+    def txt(r, c, default='-'):
+        x = r.get(c, default)
+        return default if pd.isna(x) or str(x).strip() in ('','None','nan') else str(x)
+    def won(r, c):
+        try: return f"{float(r.get(c)):,.0f}원" if pd.notna(r.get(c)) else '-'
+        except: return '-'
+    def roi(r):
+        try: return f"{float(r.get('최고ROI(%)')):.1f}%" if pd.notna(r.get('최고ROI(%)')) else '-'
+        except: return '-'
+
+    actionable = d[d['판정'].isin(['🟢🟢 강력매입','🟢 매입추천','🟠 1개 테스트'])]
+    lines=[title, f"상품: {product_name or '-'}", f"품번: {model or txt(d.iloc[0],'모델')}"]
+    if len(actionable):
+        best = actionable.iloc[0]
+        lines += ['', f"{txt(best,'판정')} BEST: KR {txt(best,'KR사이즈')}",
+                  f"매입가: {won(best,'현재매입가')}",
+                  f"추천판매처: {txt(best,'추천판매처')}",
+                  f"예상순익: {won(best,'최고예상순익')} | ROI: {roi(best)}",
+                  f"30일 판매: {txt(best,'추천처30일판매')}개",
+                  f"👉 추천: {txt(best,'추천구매수량','0')}개 매입",
+                  f"💰 최대 매입가: {won(best,'권장최대매입가')}"]
+        others = actionable.iloc[1:7]
+        if len(others):
+            lines += ['', '🟠 추가 후보']
+            for _, r in others.iterrows():
+                lines.append(f"KR {txt(r,'KR사이즈')} · {txt(r,'판정')} · 순익 {won(r,'최고예상순익')} · ROI {roi(r)} · {txt(r,'추천구매수량','0')}개")
+    else:
+        lines += ['', '🔴 지금 바로 매입할 추천 사이즈 없음']
+
+    holds = d[d['판정'].isin(['🟡 관찰','🔴 PASS','⚪ 데이터부족'])]
+    if len(holds):
+        sizes = ', '.join('KR '+txt(r,'KR사이즈') for _,r in holds.head(12).iterrows())
+        lines += ['', f"⏸ 보류/관찰: {sizes}"]
+    lines += ['', '※ 현장 판정은 현재 입력된 가격·최근 판매량 기준']
+    return '\n'.join(lines)
+
 def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target_profit, target_roi):
     """Return the maximum purchase price satisfying BOTH target profit and target ROI."""
     if sell_price is None or pd.isna(sell_price):
@@ -1597,7 +1650,7 @@ def calc_max_buy_price(sell_price, fee_rate, shipping_cost, packing_cost, target
     return max(ans, 0.0)
 
 
-st.title('KREAM · POIZON 역소싱 V17.2 ACTIVE MODEL')
+st.title('KREAM · POIZON 역소싱 V17.3 FIELD TELEGRAM')
 st.caption('Build: V17.2 · 현재 품번만 분리 비교 + POIZON 공식 API + KREAM 휴대폰 빠른입력')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
@@ -2276,6 +2329,16 @@ with t4:
             st.info('현재 기준에서 강력매입/매입추천/1개 테스트 후보가 없습니다.')
 
         st.info('POIZON은 30일 판매량 데이터가 없으면 수익성이 좋아도 자동으로 🟡 관찰로 유지합니다. 실제 매입 전 POIZON 판매량/회전성은 별도로 확인하세요.')
+
+        # ===== V17.3: 현장용 원클릭 Telegram 판정 =====
+        _product_name = str(base.iloc[0].get('name','') or '').strip() if len(base) else ''
+        if st.button('📲 현장판정 텔레그램 전송', type='primary', width='stretch', key='telegram_field_decision_v173'):
+            _tg_text = field_decision_telegram_text(compact, _product_name, _active_canonical)
+            ok, msg = send_telegram_message(_tg_text)
+            (st.success if ok else st.error)(msg)
+
+        with st.expander('📱 텔레그램 전송내용 미리보기'):
+            st.code(field_decision_telegram_text(compact, _product_name, _active_canonical), language=None)
 
 
         # ===== V6: 실전 소싱 후보 누적 저장 / 자동 랭킹 =====
