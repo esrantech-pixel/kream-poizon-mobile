@@ -1657,9 +1657,9 @@ def _lotteon_extract_model(text):
     """아디다스/나이키에서 자주 쓰는 품번 형태를 우선 추출."""
     t = re.sub(r'\s+', ' ', str(text or '')).upper()
     patterns = [
-        r'\b([A-Z]{2}\d{4})\b',                 # Adidas: JQ9826, IF6490
-        r'\b([A-Z]{2}\d{4}-\d{3})\b',        # Nike: HF1234-001
-        r'\b([A-Z]{1,3}\d{3,6}[A-Z]?)\b',     # 보조 패턴
+        r'\b([A-Z]{2}\d{4}-\d{3})\b',      # Nike: HF1234-001
+        r'\b([A-Z]{2}\d{4})\b',             # Adidas: JQ9826, IF6490
+        r'\b([A-Z]{1,3}\d{3,6}[A-Z]?)\b',    # 보조 패턴
     ]
     for p in patterns:
         m = re.search(p, t)
@@ -1670,100 +1670,217 @@ def _lotteon_extract_model(text):
 
 def _lotteon_price_num(text):
     vals=[]
-    for m in re.finditer(r'(?<!\d)(\d{1,3}(?:,\d{3})+)\s*원?', str(text or '')):
+    # 98,990원 / 98990원 모두 지원
+    for m in re.finditer(r'(?<!\d)(\d{1,3}(?:,\d{3})+|\d{4,7})\s*원?', str(text or '')):
         try:
             n=int(m.group(1).replace(',',''))
-            if 1000 <= n <= 5000000:
+            if 3000 <= n <= 5000000:
                 vals.append(n)
         except Exception:
             pass
     return vals
 
 
+def _lotteon_deescape(text):
+    t=str(text or '')
+    try:
+        t=bytes(t,'utf-8').decode('unicode_escape') if '\\u' in t else t
+    except Exception:
+        pass
+    return t.replace('\\/','/').replace('&quot;','"').replace('&amp;','&')
+
+
+def _lotteon_product_from_dict(obj, brand, base_url):
+    """롯데ON HTML/스크립트에 포함된 JSON 객체에서 상품 후보 1개를 휴리스틱 추출."""
+    if not isinstance(obj, dict):
+        return None
+    # 키 이름은 프론트 개편 때 바뀔 수 있어서 후보군을 넓게 둔다.
+    name_keys=['productName','productNm','goodsName','goodsNm','itemName','itemNm','dispNm','name','title']
+    price_keys=['salePrice','sellPrice','finalPrice','discountPrice','dcPrice','price','salePrc','sellPrc','minPrice']
+    retail_keys=['normalPrice','originalPrice','regularPrice','listPrice','orgPrice','stdPrice','maxPrice']
+    url_keys=['productUrl','goodsUrl','itemUrl','linkUrl','url','href']
+    code_keys=['modelNo','modelNumber','styleCode','productCode','goodsCode','itemCode','sellerProductCode','model']
+
+    def first(keys):
+        for k in keys:
+            v=obj.get(k)
+            if v not in (None,'',[],{}):
+                return v
+        return None
+
+    name=first(name_keys)
+    if isinstance(name,(dict,list)):
+        name=None
+    code=first(code_keys)
+    txt=' '.join(str(x) for x in [name,code,obj.get('brandName'),obj.get('brandNm')] if x not in (None,''))
+    model=_lotteon_extract_model(txt)
+
+    # 상품명/브랜드 단서가 전혀 없으면 오탐 방지
+    low=txt.lower()
+    brand_ok = ('아디다스' in txt or 'adidas' in low) if brand=='아디다스' else ('나이키' in txt or 'nike' in low)
+    if not brand_ok and not model:
+        return None
+
+    def to_num(v):
+        if isinstance(v,(int,float)):
+            n=int(v); return n if 3000 <= n <= 5000000 else None
+        ps=_lotteon_price_num(v)
+        return ps[0] if ps else None
+
+    current=to_num(first(price_keys))
+    retail=to_num(first(retail_keys))
+    # 객체 전체 문자열에서도 가격 보조 탐색
+    if current is None:
+        try:
+            ps=_lotteon_price_num(json.dumps(obj,ensure_ascii=False))
+            if ps: current=min(ps)
+        except Exception:
+            pass
+    if current is None:
+        return None
+    if retail is None or retail < current:
+        retail=current
+
+    href=first(url_keys)
+    if isinstance(href,str) and href:
+        full=urllib.parse.urljoin(base_url, href)
+    else:
+        full=''
+    disc=round((retail-current)/retail*100,1) if retail>current else 0.0
+    return {
+        '선택':False,'브랜드':brand,'상품명':str(name or txt)[:240],'품번':model,
+        '현재가':current,'정상가':retail,'할인율(%)':disc,'링크':full,
+        '수집상태':'JSON추출'
+    }
+
+
+def _walk_json_products(obj, brand, base_url, rows, depth=0):
+    if depth>16 or len(rows)>1000:
+        return
+    if isinstance(obj,dict):
+        row=_lotteon_product_from_dict(obj,brand,base_url)
+        if row: rows.append(row)
+        for v in obj.values():
+            if isinstance(v,(dict,list)):
+                _walk_json_products(v,brand,base_url,rows,depth+1)
+    elif isinstance(obj,list):
+        for v in obj:
+            if isinstance(v,(dict,list)):
+                _walk_json_products(v,brand,base_url,rows,depth+1)
+
+
+def _lotteon_parse_text_blob(text, brand, source_url='', status='텍스트추출'):
+    """브라우저에서 복사한 검색결과 텍스트 또는 HTML 평문을 품번 중심으로 파싱."""
+    blob=_lotteon_deescape(text)
+    blob=re.sub(r'<[^>]+>',' ',blob)
+    blob=re.sub(r'\s+',' ',blob)
+    rows=[]
+    # 모델번호를 기준으로 주변 500자를 카드처럼 본다.
+    pat=r'([A-Z]{2}\d{4}-\d{3}|[A-Z]{2}\d{4})'
+    seen=set()
+    for mm in re.finditer(pat, blob.upper()):
+        model=mm.group(1)
+        if model in seen: continue
+        seen.add(model)
+        a=max(0,mm.start()-260); b=min(len(blob),mm.end()+420)
+        chunk=blob[a:b]
+        low=chunk.lower()
+        brand_ok=('아디다스' in chunk or 'adidas' in low) if brand=='아디다스' else ('나이키' in chunk or 'nike' in low)
+        if not brand_ok:
+            continue
+        ps=_lotteon_price_num(chunk)
+        if not ps: continue
+        current=min(ps); retail=max(ps); retail=max(retail,current)
+        disc=round((retail-current)/retail*100,1) if retail>current else 0.0
+        rows.append({'선택':False,'브랜드':brand,'상품명':chunk[:240],'품번':model,
+                     '현재가':current,'정상가':retail,'할인율(%)':disc,'링크':source_url,
+                     '수집상태':status})
+    return rows
+
+
 def fetch_lotteon_search(brand='아디다스', max_items=120):
-    """롯데백화점(mallId=2) 검색결과에서 신발 후보를 수집.
-    사이트 구조 변경/접근차단 시 빈 결과와 진단 메시지를 반환한다.
-    """
-    brand = str(brand or '').strip()
-    url = 'https://www.lotteon.com/csearch/search/search?' + urllib.parse.urlencode({
+    """V18.1: HTML + script JSON + 평문 3단계로 롯데백화점 검색 결과를 수집."""
+    brand=str(brand or '').strip()
+    base='https://www.lotteon.com'
+    url=base + '/csearch/search/search?' + urllib.parse.urlencode({
         'render':'search','platform':'pc','q':brand,'mallId':'2'
     })
     headers={
-        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+        'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language':'ko-KR,ko;q=0.9,en;q=0.7',
-        'Referer':'https://www.lotteon.com/'
+        'Cache-Control':'no-cache','Pragma':'no-cache','Referer':base+'/'
     }
     try:
-        r=requests.get(url, headers=headers, timeout=20)
+        sess=requests.Session()
+        r=sess.get(url,headers=headers,timeout=25,allow_redirects=True)
+        status=r.status_code
         r.raise_for_status()
-        html=r.text
+        html=r.text or ''
     except Exception as e:
-        return pd.DataFrame(), url, f'롯데ON 접속 실패: {e}'
+        return pd.DataFrame(),url,f'롯데ON 접속 실패: {e}'
 
     rows=[]
-    # 1) HTML 링크 기반 파싱. BeautifulSoup가 있으면 사용.
+    diagnostics=[]
+    diagnostics.append(f'HTTP {status}, HTML {len(html):,}자')
+
+    # 1) HTML 상품 링크/카드 파싱
     try:
         from bs4 import BeautifulSoup
         soup=BeautifulSoup(html,'html.parser')
-        for a in soup.find_all('a', href=True):
+        for a in soup.find_all('a',href=True):
             txt=' '.join(a.stripped_strings)
-            href=a.get('href','')
-            if not txt or len(txt) < 8:
-                continue
-            low=txt.lower()
-            # 브랜드 및 신발성 키워드. 상품명에 브랜드가 생략된 카드도 허용.
-            if brand == '아디다스':
-                brand_ok=('아디다스' in txt or 'adidas' in low)
-            else:
-                brand_ok=('나이키' in txt or 'nike' in low)
-            shoe_ok=any(k in low for k in ['운동화','스니커','러닝','슈즈','신발','sneaker','running','shoe','조던','에어맥스','삼바','가젤','아디제로'])
+            if not txt or len(txt)<8: continue
+            low=txt.lower(); href=a.get('href','')
+            brand_ok=('아디다스' in txt or 'adidas' in low) if brand=='아디다스' else ('나이키' in txt or 'nike' in low)
             model=_lotteon_extract_model(txt)
-            prices=_lotteon_price_num(txt)
-            if not brand_ok and not model:
-                continue
-            if not shoe_ok and not model:
-                continue
-            if not prices:
-                continue
-            full=urllib.parse.urljoin('https://www.lotteon.com', href)
-            # 현재가/정상가는 카드 내 가격들의 최소/최대로 보수 추정
-            current=min(prices)
-            retail=max(prices)
-            if retail < current: retail=current
+            if not brand_ok and not model: continue
+            ps=_lotteon_price_num(txt)
+            if not ps: continue
+            current=min(ps); retail=max(ps); retail=max(retail,current)
             disc=round((retail-current)/retail*100,1) if retail>current else 0.0
-            rows.append({
-                '선택':False,'브랜드':brand,'상품명':txt[:240],'품번':model,
-                '현재가':current,'정상가':retail,'할인율(%)':disc,
-                '링크':full,'수집상태':'자동수집'
-            })
-    except Exception:
-        pass
+            rows.append({'선택':False,'브랜드':brand,'상품명':txt[:240],'품번':model,
+                         '현재가':current,'정상가':retail,'할인율(%)':disc,
+                         '링크':urllib.parse.urljoin(base,href),'수집상태':'HTML카드'})
 
-    # 2) JSON/스크립트 안 상품 텍스트 보조 파싱: 품번 주변에서 가격 찾기.
-    if len(rows) < 5:
-        clean=re.sub(r'<[^>]+>', ' ', html)
-        clean=re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1),16)), clean)
-        clean=re.sub(r'\\/', '/', clean)
-        clean=re.sub(r'\s+', ' ', clean)
-        for mm in re.finditer(r'([A-Z]{2}\d{4}(?:-\d{3})?)', clean.upper()):
-            a=max(0,mm.start()-180); b=min(len(clean),mm.end()+280)
-            chunk=clean[a:b]
-            prices=_lotteon_price_num(chunk)
-            if not prices: continue
-            model=mm.group(1)
-            current=min(prices); retail=max(prices); retail=max(retail,current)
-            disc=round((retail-current)/retail*100,1) if retail>current else 0.0
-            rows.append({'선택':False,'브랜드':brand,'상품명':chunk[:240],'품번':model,'현재가':current,'정상가':retail,'할인율(%)':disc,'링크':url,'수집상태':'보조추출'})
+        # 2) script 태그 안 JSON / JSON 유사 데이터 재귀 탐색
+        for sc in soup.find_all('script'):
+            stxt=sc.string or sc.get_text() or ''
+            stxt=stxt.strip()
+            if not stxt: continue
+            candidates=[]
+            if stxt[:1] in '[{': candidates.append(stxt)
+            # __NEXT_DATA__, application/json 등은 위에서 바로 처리됨.
+            # JS 변수 할당 형태에서 가장 큰 JSON 객체를 보조 추출.
+            if not candidates and ('product' in stxt.lower() or 'goods' in stxt.lower()):
+                i=stxt.find('{'); j=stxt.rfind('}')
+                if 0 <= i < j: candidates.append(stxt[i:j+1])
+            for raw in candidates[:3]:
+                try:
+                    obj=json.loads(raw)
+                    _walk_json_products(obj,brand,base,rows)
+                except Exception:
+                    pass
+    except Exception as e:
+        diagnostics.append(f'BS4 파싱:{type(e).__name__}')
+
+    # 3) 원문 전체를 평문으로 품번 주변 파싱
+    rows.extend(_lotteon_parse_text_blob(html,brand,url,'원문보조'))
 
     if not rows:
-        return pd.DataFrame(), url, '검색 페이지는 열렸지만 상품카드를 읽지 못했습니다. 롯데ON 페이지 구조 변경 또는 자동접근 차단 가능성이 있습니다.'
+        msg=' / '.join(diagnostics)
+        if len(html)<30000:
+            msg += ' / 검색결과가 브라우저 JavaScript로 후로딩되는 페이지로 보입니다.'
+        return pd.DataFrame(),url,'자동수집 0개 · '+msg
 
     d=pd.DataFrame(rows)
-    # 품번+가격+링크 기준 중복 제거
-    d['_key']=d['품번'].fillna('').astype(str)+'|'+d['현재가'].astype(str)+'|'+d['링크'].astype(str)
-    d=d.drop_duplicates('_key').drop(columns=['_key']).head(int(max_items)).reset_index(drop=True)
-    return d, url, f'{len(d)}개 후보 수집'
-
+    # 품번이 있으면 품번 우선, 없으면 상품명+가격으로 중복 제거
+    d['_key']=d.apply(lambda x: ((str(x.get('품번') or '').strip() or str(x.get('상품명') or '')[:80])+'|'+str(x.get('현재가') or '')),axis=1)
+    d=d.drop_duplicates('_key').drop(columns=['_key'])
+    # 링크가 빈 JSON행은 검색 URL로 보완
+    d['링크']=d['링크'].fillna('').astype(str).replace('',url)
+    d=d.head(int(max_items)).reset_index(drop=True)
+    return d,url,f'{len(d)}개 후보 수집 · '+ ' / '.join(diagnostics)
 
 def save_lotteon_db(df):
     df.to_csv(LOTTEON_PATH,index=False,encoding='utf-8-sig')
@@ -1779,8 +1896,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.0')
-st.caption('Build: V18.0 · 롯데ON 아디다스/나이키 자동소싱 1단계 + 기존 POIZON/KREAM 비교 유지')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.1')
+st.caption('Build: V18.1 · 롯데ON 수집기 강화(JSON/HTML/평문 3단계) + 아디다스/나이키')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -1932,7 +2049,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · 1단계')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V18.1')
     st.caption('현재는 아디다스·나이키 신발 후보의 상품명/품번/가격/할인율/링크를 자동 수집합니다. 다음 단계에서 POIZON·KREAM·쿠팡 자동비교를 연결합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -1974,6 +2091,25 @@ with tl:
     q1,q2=st.columns(2)
     q1.link_button('롯데백화점 아디다스 직접 확인','https://www.lotteon.com/csearch/search/search?render=search&platform=pc&q=%EC%95%84%EB%94%94%EB%8B%A4%EC%8A%A4&mallId=2',width='stretch')
     q2.link_button('롯데백화점 나이키 직접 확인','https://www.lotteon.com/csearch/search/search?render=search&platform=pc&q=%EB%82%98%EC%9D%B4%ED%82%A4&mallId=2',width='stretch')
+
+    st.markdown('### 🧰 자동수집이 0개일 때 보조 입력')
+    st.caption('롯데ON은 일부 검색결과를 브라우저에서 JavaScript로 뒤늦게 표시할 수 있습니다. 자동수집이 0개면 검색페이지에서 Ctrl+A → Ctrl+C 후 아래에 붙여넣으면 품번/가격을 바로 추출합니다.')
+    pasted=st.text_area('롯데ON 검색결과 페이지 텍스트 붙여넣기',height=120,key='lotte_paste_text',placeholder='검색결과 페이지에서 Ctrl+A → Ctrl+C → 여기에 Ctrl+V')
+    pp1,pp2=st.columns([1,3])
+    paste_brand=pp1.selectbox('붙여넣기 브랜드',['아디다스','나이키'],key='lotte_paste_brand')
+    if pp2.button('📋 붙여넣은 페이지에서 상품 추출',width='stretch',key='lotte_parse_paste'):
+        if not pasted.strip():
+            st.warning('먼저 롯데ON 검색결과 페이지 내용을 붙여넣어 주세요.')
+        else:
+            src='https://www.lotteon.com/csearch/search/search?render=search&platform=pc&q='+urllib.parse.quote(paste_brand)+'&mallId=2'
+            rr=_lotteon_parse_text_blob(pasted,paste_brand,src,'브라우저복사')
+            if rr:
+                dd=pd.DataFrame(rr).drop_duplicates(subset=['품번','현재가']).reset_index(drop=True)
+                save_lotteon_db(dd)
+                st.session_state['lotteon_results']=dd
+                st.success(f'{len(dd)}개 후보를 추출했습니다.')
+            else:
+                st.error('품번/가격 조합을 찾지 못했습니다. 상품목록이 보이도록 페이지 전체를 복사했는지 확인해 주세요.')
 
     lotte=st.session_state.get('lotteon_results')
     if lotte is None or not isinstance(lotte,pd.DataFrame):
