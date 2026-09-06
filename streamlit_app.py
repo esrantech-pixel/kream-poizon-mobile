@@ -7,6 +7,7 @@ from PIL import Image, ImageOps, ImageEnhance
 import pytesseract
 from openai import OpenAI
 import base64
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 # ===== V19.0 MULTI-SOURCE FRAMEWORK =====
 # 실제 자동수집은 소싱처별로 단계적으로 연결합니다.
@@ -47,7 +48,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V19.3.1', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V19.3.2', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -2366,6 +2367,37 @@ def v19_1_lotte_poizon_batch(source_df, max_products=10):
 
 
 
+
+def kream_auto_lookup_hard_timeout(model, hard_timeout_sec=18):
+    """
+    V19.3.2
+    KREAM 자동검색+사이즈조회 전체를 hard timeout으로 감싼다.
+    시간이 넘으면 현재 상품은 즉시 'KREAM 미확인'으로 넘기고
+    POIZON 1차판정 결과를 보존한다.
+    """
+    model = str(model or '').strip().upper()
+    if not model:
+        raise ValueError('KREAM 모델/품번이 비어 있습니다.')
+
+    def _job():
+        pid, info = kream_find_product_id(model)
+        df = kream_lookup_product(pid, model=model)
+        return pid, info, df
+
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='kream_lookup')
+    fut = executor.submit(_job)
+    try:
+        return fut.result(timeout=float(hard_timeout_sec))
+    except FuturesTimeoutError:
+        fut.cancel()
+        raise TimeoutError(
+            f'KREAM 자동조회 {int(hard_timeout_sec)}초 초과 → 자동 건너뜀'
+        )
+    finally:
+        # 핵심: 실행 중인 네트워크 스레드를 기다리지 않고 UI를 즉시 반환
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     """POIZON 1차 매입후보만 KREAM 자동조회 후 동일 KR사이즈로 최종 교차판정."""
     if poizon_batch_df is None or not isinstance(poizon_batch_df, pd.DataFrame) or poizon_batch_df.empty:
@@ -2426,12 +2458,16 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
         kstatus = ''
         kauto = pd.DataFrame()
         try:
-            kpid, _kinfo = kream_find_product_id(model)
-            kauto = kream_lookup_product(kpid, model=model)
+            kpid, _kinfo, kauto = kream_auto_lookup_hard_timeout(model, hard_timeout_sec=18)
             if kauto is None or len(kauto) == 0:
                 raise RuntimeError('사이즈별 입찰/체결 데이터 없음')
             upsert_platform_cache(kauto, KREAM_CACHE_PATH)
             kstatus = f'✅ 자동연결 {len(kauto)}사이즈'
+        except TimeoutError as e:
+            kstatus = '⏱️ KREAM 시간초과 / 자동건너뜀'
+            messages.append(f'{model}: {str(e)}')
+            kauto = pd.DataFrame()
+            kpid = ''
         except Exception as e:
             kstatus = '⚠️ KREAM 자동조회 실패'
             messages.append(f'{model}: KREAM 자동조회 실패 - {str(e)[:180]}')
@@ -2522,8 +2558,8 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V19.3.1')
-st.caption('Build: V19.3.1 · KREAM HTTP500 자동 재시도 + 검색어 변형 + 미확인 안전표시')
+st.title('KREAM · POIZON · COUPANG 소싱 V19.3.2')
+st.caption('Build: V19.3.2 · KREAM 강제 시간제한 + 자동건너뛰기 + POIZON 결과 보존')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2674,7 +2710,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V19.3.1')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V19.3.2')
     st.caption('아디다스·나이키 후보를 수집한 뒤 품번별 POIZON 공식 API를 일괄 조회해 1차 소싱 후보를 자동 판정합니다. KREAM·쿠팡은 다음 단계에서 BEST 판매처 교차비교로 확장합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -2806,7 +2842,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
 
-        st.markdown('#### 🚀 V19.3.1 롯데 후보 → POIZON 1차판정')
+        st.markdown('#### 🚀 V19.3.2 롯데 후보 → POIZON 1차판정')
         st.caption('롯데에서 잡힌 아디다스·나이키 품번을 POIZON 공식 API로 순차 조회해 실제 판매량이 있는 가격만으로 소싱 가능성을 판정합니다.')
         bc1,bc2=st.columns([1,3])
         _batch_n=bc1.number_input(
@@ -2861,7 +2897,7 @@ with tl:
             else:
                 st.warning('이번 검사 상품에서는 POIZON 기준 매입후보가 없습니다.')
 
-            st.markdown('#### 🔁 V19.3.1 POIZON 매입후보 → KREAM 자동 교차검증')
+            st.markdown('#### 🔁 V19.3.2 POIZON 매입후보 → KREAM 자동 교차검증')
             st.caption(
                 'POIZON 1차판정에서 살아남은 상품만 KREAM에서 정확 품번으로 자동 매칭합니다. '
                 '같은 KR 사이즈끼리 즉시판매가·최근체결가·30일 판매량을 비교해 최종 BEST 판매처를 고릅니다.'
@@ -2873,7 +2909,7 @@ with tl:
                     f'🔎 매입후보 {_cross_count}개 KREAM 자동 교차검증',
                     type='primary', width='stretch', key='v193_kream_cross_run'
                 ):
-                    with st.spinner(f'KREAM에서 POIZON 매입후보 {_cross_count}개를 교차검증 중...'):
+                    with st.spinner(f'KREAM 교차검증 중... 상품당 최대 18초, 시간초과 시 자동 건너뜁니다.'):
                         _xout, _xmsg = v19_3_kream_cross_batch(_buyable, max_products=_cross_count)
                     st.session_state['v193_kream_cross_result'] = _xout
                     st.session_state['v193_kream_cross_messages'] = _xmsg
@@ -2939,7 +2975,7 @@ with tl:
                     st.caption(str(_m))
 
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 상세 확인 · V19.3.1')
+        st.markdown('#### 🧪 1개 상품 상세 확인 · V19.3.2')
         st.caption('후보 1개를 골라 POIZON 공식 API로 상세검증하고, 아래 KREAM 자동 교차검증으로 동일 품번·동일 KR사이즈를 다시 확인합니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
@@ -3052,7 +3088,7 @@ with tl:
                             else:
                                 st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 판매량 없는 POIZON 가격은 수익 계산에서 제외했습니다.')
 
-                    st.markdown('##### 🔁 V19.3.1 KREAM 자동 교차검증')
+                    st.markdown('##### 🔁 V19.3.2 KREAM 자동 교차검증')
                     st.caption('같은 품번을 KREAM에서 자동 매칭해 즉시판매가(최고 매입입찰)·30일 체결을 가져오고 POIZON과 같은 사이즈로 비교합니다.')
                     if st.button('🔎 KREAM 자동조회 + POIZON 교차비교', type='primary', width='stretch', key='lotte_v188_kream_auto'):
                         try:
