@@ -2044,8 +2044,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.7')
-st.caption('Build: V18.7 · 롯데ON 매입가 → POIZON 공식 API → 사이즈별 즉시 매입판정 + KREAM 교차검증')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.8')
+st.caption('Build: V18.8 · 롯데ON 매입가 → POIZON 공식 API → 유효 판매량 기반 즉시 매입판정 + KREAM 자동 교차검증')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2329,7 +2329,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.7')
+        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.8')
         st.caption('후보 1개를 골라 롯데 매입가를 고정하고 POIZON 공식 API까지 바로 연결합니다. KREAM은 다음 탭에서 휴대폰 즉시판매가만 입력하면 자동비교가 완성됩니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
