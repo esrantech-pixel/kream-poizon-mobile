@@ -1693,7 +1693,29 @@ def _lotteon_deescape(text):
         t=bytes(t,'utf-8').decode('unicode_escape') if '\\u' in t else t
     except Exception:
         pass
-    return t.replace('\\/','/').replace('&quot;','"').replace('&amp;','&')
+    t=t.replace('\\/','/').replace('&quot;','"').replace('&amp;','&')
+    # LotteON sometimes stores Korean product names URL-encoded (%EC%...).
+    try:
+        for _ in range(2):
+            u=urllib.parse.unquote(t)
+            if u==t: break
+            t=u
+    except Exception:
+        pass
+    return t
+
+
+def _lotteon_clean_name(name, brand='', model=''):
+    s=_lotteon_deescape(name).strip()
+    s=re.sub(r'<[^>]+>',' ',s)
+    s=re.sub(r'\s+',' ',s).strip(' |,-')
+    # Remove common JSON/URL debris while preserving useful Korean/English product text.
+    if len(s)>220 or ('%EB%' in s and '%' in s):
+        try: s=urllib.parse.unquote(s)
+        except Exception: pass
+    if not s or s.lower() in {'포함','제외','이전 이상'}:
+        s=f'{brand} {model}'.strip()
+    return s[:220]
 
 
 def _lotteon_flatten(obj, out=None, prefix=''):
@@ -1871,7 +1893,7 @@ def _lotteon_product_from_chunk_v184(chunk, brand, model, source_url=''):
     if retail is None or retail < current or retail > current*5:
         retail=current
 
-    name=_lotteon_nearest_text_value(chunk,center,name_keys) or f'{brand} {model}'
+    name=_lotteon_clean_name(_lotteon_nearest_text_value(chunk,center,name_keys),brand,model)
     bname=_lotteon_nearest_text_value(chunk,center,brand_keys,80)
     # Reject obvious non-product labels but keep model-based fallback.
     if len(name)>220 or name.lower() in {'포함','제외','이전 이상'}:
@@ -1883,11 +1905,12 @@ def _lotteon_product_from_chunk_v184(chunk, brand, model, source_url=''):
     if brand=='나이키' and not ('나이키' in name or 'nike' in low or model.upper() in name.upper()):
         name=f'{brand} {model}'
 
+    name=_lotteon_clean_name(name,brand,model)
     href=_lotteon_nearest_text_value(chunk,center,link_keys,700)
     full=urllib.parse.urljoin('https://www.lotteon.com',href) if href else source_url
     disc=round((retail-current)/retail*100,1) if retail and retail>current else 0.0
     return {'선택':False,'브랜드':brand,'상품명':name[:220],'품번':model,'현재가':int(current),
-            '정상가':int(retail),'할인율(%)':disc,'링크':full or source_url,'수집상태':'V18.4실제필드'}
+            '정상가':int(retail),'할인율(%)':disc,'링크':full or source_url,'수집상태':'V18.5실제필드'}
 
 
 def _lotteon_diag_extract_fields(chunk, brand, model):
@@ -1912,7 +1935,7 @@ def _lotteon_parse_text_blob(text, brand, source_url='', status='텍스트추출
         if not brand_ok: continue
         row=_lotteon_product_from_chunk_v184(chunk,brand,model,source_url)
         if row:
-            row['수집상태']=status+'·V18.4'
+            row['수집상태']=status+'·V18.5'
             rows.append(row); seen.add(model)
     return rows
 
@@ -2017,8 +2040,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.4')
-st.caption('Build: V18.4 · 롯데ON 실제 필드 고정 파싱 + 가격/상품명/링크 정밀 추출')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.5')
+st.caption('Build: V18.5 · 롯데ON 한글 상품명 정상화 + POIZON/KREAM 비교목록 원클릭 전달')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2170,7 +2193,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V18.4')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V18.5')
     st.caption('현재는 아디다스·나이키 신발 후보의 상품명/품번/가격/할인율/링크를 자동 수집합니다. 다음 단계에서 POIZON·KREAM·쿠팡 자동비교를 연결합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -2243,7 +2266,7 @@ with tl:
         picked=next((x['원본주변'] for x in drows if x['품번후보']==pick),'')
         st.code(picked,language='json')
         extracted=_lotteon_diag_extract_fields(picked,diag_brand,pick)
-        st.markdown('#### ✅ V18.4 실제 필드 추출 결과')
+        st.markdown('#### ✅ V18.5 실제 필드 추출 결과')
         st.dataframe(pd.DataFrame([extracted]),width='stretch',hide_index=True)
         if extracted.get('현재가'):
             st.caption(f"확인값 → 상품명: {extracted.get('상품명','-')} / 현재가: {int(extracted.get('현재가') or 0):,}원 / 정상가: {int(extracted.get('정상가') or 0):,}원 / 할인율: {extracted.get('할인율(%)','-')}%")
@@ -2278,6 +2301,11 @@ with tl:
         lotte=load_lotteon_db()
     if len(lotte):
         view=lotte.copy()
+        if '상품명' in view.columns:
+            view['상품명']=[_lotteon_clean_name(n,b,m) for n,b,m in zip(view['상품명'],view.get('브랜드',''),view.get('품번',''))]
+        if '품번' in view.columns:
+            view['POIZON검색']=view['품번'].astype(str).map(lambda x: f'https://kr.poizon.com/search?keyword={urllib.parse.quote(x)}' if x else '')
+            view['KREAM검색']=view['품번'].astype(str).map(lambda x: f'https://kream.co.kr/search?keyword={urllib.parse.quote(x)}' if x else '')
         view['할인율(%)']=pd.to_numeric(view['할인율(%)'],errors='coerce').fillna(0)
         view=view[view['할인율(%)']>=float(min_discount)].copy()
         st.markdown(f'### 조건 통과 후보 · {len(view)}개')
@@ -2290,6 +2318,8 @@ with tl:
                 '정상가':st.column_config.NumberColumn('정상가',format='%,d원'),
                 '할인율(%)':st.column_config.NumberColumn('할인율',format='%.1f%%'),
                 '링크':st.column_config.LinkColumn('상품보기',display_text='열기'),
+                'POIZON검색':st.column_config.LinkColumn('POIZON',display_text='검색'),
+                'KREAM검색':st.column_config.LinkColumn('KREAM',display_text='검색'),
             }
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
@@ -2304,9 +2334,15 @@ with tl:
                     price=won_to_num(r.get('현재가'))
                     if not model or not price:
                         skipped+=1; continue
-                    upsert_product(model,int(price),f"{r.get('브랜드','')} {r.get('상품명','')}")
+                    clean_name=_lotteon_clean_name(r.get('상품명',''),r.get('브랜드',''),model)
+                    upsert_product(model,int(price),clean_name)
+                    set_active_model(model, clear_live_platform=True)
+                    st.session_state['_lotte_last_handoff_model']=model
                     ok+=1
                 st.success(f'비교목록에 {ok}개 추가 · 품번/가격 미확인 {skipped}개 제외')
+                if ok:
+                    last=st.session_state.get('_lotte_last_handoff_model','')
+                    st.info(f'✅ {last}까지 비교 준비 완료. 위의 ② POIZON 가져오기 → ③ KREAM 가져오기 → ④ 자동 비교 순서로 진행하세요.')
         if a2.button('📲 선택상품 텔레그램 전송',width='stretch',key='lotte_send_selected'):
             if len(selected)==0:
                 st.warning('전송할 상품을 선택하세요.')
@@ -2316,6 +2352,12 @@ with tl:
                     lines += ['',f"{r.get('브랜드','')} · {r.get('품번','-')}",str(r.get('상품명',''))[:70],f"매입가 {int(float(r.get('현재가',0))):,}원 · 할인 {float(r.get('할인율(%)',0)):.1f}%",str(r.get('링크',''))]
                 ok,msg=send_telegram_message('\n'.join(lines))
                 (st.success if ok else st.error)(msg)
+        last=st.session_state.get('_lotte_last_handoff_model','')
+        if last:
+            st.markdown('#### 🔗 마지막 전달상품 빠른 확인')
+            q1,q2=st.columns(2)
+            q1.link_button(f'POIZON에서 {last} 검색',f'https://kr.poizon.com/search?keyword={urllib.parse.quote(last)}',width='stretch',key='lotte_last_poizon')
+            q2.link_button(f'KREAM에서 {last} 검색',f'https://kream.co.kr/search?keyword={urllib.parse.quote(last)}',width='stretch',key='lotte_last_kream')
         st.caption('품번이 비어 있거나 상품명이 이상한 행은 아직 매입하지 말고 상품 상세페이지에서 품번을 먼저 확인하세요.')
     else:
         st.warning('아직 수집된 상품이 없습니다. 위의 자동수집 버튼을 눌러 첫 테스트를 시작하세요.')
