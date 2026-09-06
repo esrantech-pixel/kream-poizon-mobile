@@ -1757,8 +1757,8 @@ def _lotteon_product_from_dict(obj, brand, base_url):
     brand_ok=('아디다스' in name or 'adidas' in low) if brand=='아디다스' else ('나이키' in name or 'nike' in low)
     if not brand_ok and not model: return None
 
-    sale_pats=[r'^(sl|sale|sell|final|dc|dsc|discount).*?(prc|price)$',r'^(slprc|saleprc|sellprc|saleprice|sellprice|finalprice|dcprice|dscprc)$']
-    retail_pats=[r'^(std|normal|org|origin|original|regular|list).*?(prc|price)$',r'^(stdprc|normalprice|orgprice|originalprice|regularprice|listprice)$']
+    sale_pats=[r'^(sl|sale|sell|final|dc|dsc|discount).*?(prc|price)$',r'^(slprc|saleprc|sellprc|saleprice|sellprice|finalprice|final_price|dcprice|dscprc|discountprice)$']
+    retail_pats=[r'^(std|normal|org|origin|original|regular|list).*?(prc|price)$',r'^(price|stdprc|normalprice|orgprice|originalprice|regularprice|listprice)$']
     current=_lotteon_pick_named_number(flat,sale_pats)
     retail=_lotteon_pick_named_number(flat,retail_pats)
     if current is None: return None
@@ -1814,8 +1814,90 @@ def _lotteon_keyed_name(chunk, brand, model):
     return vals[0] if vals else ''
 
 
+
+def _lotteon_key_values_near(chunk, key_names):
+    """Return [(key,value,pos)] for quoted/unquoted JS/JSON keys near a model."""
+    out=[]
+    for key in key_names:
+        pat=(r'(?i)(?:["\']?'+re.escape(key)+r'["\']?)\s*:\s*'
+             r'(?:(?:["\'])(.*?)(?:["\'])|(-?[\d,]+(?:\.\d+)?))')
+        for m in re.finditer(pat, chunk, re.S):
+            raw=m.group(1) if m.group(1) is not None else m.group(2)
+            if raw is None: continue
+            out.append((key,_lotteon_deescape(raw),m.start()))
+    return out
+
+
+def _lotteon_nearest_text_value(chunk, center, keys, max_len=260):
+    vals=[]
+    for k,v,pos in _lotteon_key_values_near(chunk,keys):
+        v=str(v or '').strip()
+        if 2 <= len(v) <= max_len:
+            vals.append((abs(pos-center),pos,k,v))
+    vals.sort(key=lambda x:(x[0],x[1]))
+    return vals[0][3] if vals else ''
+
+
+def _lotteon_nearest_number(chunk, center, keys, lo=5000, hi=5000000):
+    vals=[]
+    for k,v,pos in _lotteon_key_values_near(chunk,keys):
+        try:
+            n=int(float(str(v).replace(',','').strip()))
+        except Exception:
+            continue
+        if lo <= n <= hi:
+            vals.append((abs(pos-center),pos,k,n))
+    vals.sort(key=lambda x:(x[0],x[1]))
+    return vals[0][3] if vals else None
+
+
+def _lotteon_product_from_chunk_v184(chunk, brand, model, source_url=''):
+    """Parse one LotteON product from the real field names found in diagnostics."""
+    up=chunk.upper(); center=max(0, up.find(str(model).upper()))
+    # Exact keys observed in LotteON raw source. Priority matters.
+    sale_keys=['discountPrice','final_price','finalPrice','salePrice','sellPrice','slPrc','salePrc','sellPrc','dcPrice','dscPrc']
+    retail_keys=['price','originalPrice','regularPrice','listPrice','normalPrice','stdPrice','orgPrice','stdPrc','orgPrc']
+    name_keys=['productName','goodsName','itemName','productNm','goodsNm','itemNm','pdNm','spdNm','dispPdNm','dispNm','name','title']
+    link_keys=['productLink','productUrl','link','url','href']
+    brand_keys=['brandName','brandNm']
+
+    current=_lotteon_nearest_number(chunk,center,sale_keys)
+    retail=_lotteon_nearest_number(chunk,center,retail_keys)
+    # When no explicit sale price exists, price can be the current price.
+    if current is None:
+        current=retail
+    if current is None:
+        return None
+    if retail is None or retail < current or retail > current*5:
+        retail=current
+
+    name=_lotteon_nearest_text_value(chunk,center,name_keys) or f'{brand} {model}'
+    bname=_lotteon_nearest_text_value(chunk,center,brand_keys,80)
+    # Reject obvious non-product labels but keep model-based fallback.
+    if len(name)>220 or name.lower() in {'포함','제외','이전 이상'}:
+        name=f'{brand} {model}'
+    low=(name+' '+bname).lower()
+    if brand=='아디다스' and not ('아디다스' in name or 'adidas' in low or model.upper() in name.upper()):
+        # model itself is sufficient evidence; keep row but use clean fallback name
+        name=f'{brand} {model}'
+    if brand=='나이키' and not ('나이키' in name or 'nike' in low or model.upper() in name.upper()):
+        name=f'{brand} {model}'
+
+    href=_lotteon_nearest_text_value(chunk,center,link_keys,700)
+    full=urllib.parse.urljoin('https://www.lotteon.com',href) if href else source_url
+    disc=round((retail-current)/retail*100,1) if retail and retail>current else 0.0
+    return {'선택':False,'브랜드':brand,'상품명':name[:220],'품번':model,'현재가':int(current),
+            '정상가':int(retail),'할인율(%)':disc,'링크':full or source_url,'수집상태':'V18.4실제필드'}
+
+
+def _lotteon_diag_extract_fields(chunk, brand, model):
+    row=_lotteon_product_from_chunk_v184(chunk,brand,model,'')
+    if not row:
+        return {'품번':model,'상품명':'','현재가':'','정상가':'','할인율(%)':'','링크':''}
+    return {k:row.get(k,'') for k in ['품번','상품명','현재가','정상가','할인율(%)','링크']}
+
 def _lotteon_parse_text_blob(text, brand, source_url='', status='텍스트추출'):
-    """품번 주변 JSON 키를 이용해 가격/상품명을 정밀 추출. 품번 숫자를 가격으로 오인하지 않는다."""
+    """V18.4: model-centered extraction using actual LotteON field names."""
     blob=_lotteon_deescape(text)
     rows=[]; seen=set()
     pat=r'(?<![A-Z0-9])([A-Z]{2}\d{4}-\d{3}|[A-Z]{2}\d{4})(?![A-Z0-9])'
@@ -1823,26 +1905,16 @@ def _lotteon_parse_text_blob(text, brand, source_url='', status='텍스트추출
     for mm in re.finditer(pat,up):
         model=mm.group(1)
         if model in seen: continue
-        a=max(0,mm.start()-1000); b=min(len(blob),mm.end()+1600)
+        a=max(0,mm.start()-2200); b=min(len(blob),mm.end()+3000)
         chunk=blob[a:b]
         low=chunk.lower()
         brand_ok=('아디다스' in chunk or 'adidas' in low) if brand=='아디다스' else ('나이키' in chunk or 'nike' in low)
         if not brand_ok: continue
-        current=_lotteon_keyed_price(chunk,False)
-        retail=_lotteon_keyed_price(chunk,True)
-        # 화면에 실제로 렌더된 98,990원 같은 표기가 있으면 보조 사용
-        if current is None:
-            ps=_lotteon_price_num(chunk,strict=True)
-            if ps: current=min(ps)
-        if current is None: continue
-        if retail is None or retail < current or retail > current*5: retail=current
-        name=_lotteon_keyed_name(chunk,brand,model) or f'{brand} {model}'
-        disc=round((retail-current)/retail*100,1) if retail>current else 0.0
-        rows.append({'선택':False,'브랜드':brand,'상품명':name[:220],'품번':model,'현재가':current,
-                     '정상가':retail,'할인율(%)':disc,'링크':source_url,'수집상태':status+'정밀'})
-        seen.add(model)
+        row=_lotteon_product_from_chunk_v184(chunk,brand,model,source_url)
+        if row:
+            row['수집상태']=status+'·V18.4'
+            rows.append(row); seen.add(model)
     return rows
-
 
 def _lotteon_extract_json_candidates(html):
     """script 전체를 JSON.parse 없이도 가능한 범위에서 객체 후보로 분리."""
@@ -1860,7 +1932,7 @@ def _lotteon_extract_json_candidates(html):
 
 
 def fetch_lotteon_search(brand='아디다스', max_items=120):
-    """V18.2: 롯데ON 원문 JSON 키 기반 정밀 파싱. 품번/날짜 숫자의 가격 오인식 제거."""
+    """V18.4: 롯데ON 진단에서 확인한 실제 필드 기반 파싱."""
     brand=str(brand or '').strip(); base='https://www.lotteon.com'
     url=base+'/csearch/search/search?'+urllib.parse.urlencode({'render':'search','platform':'pc','q':brand,'mallId':'2'})
     headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36','Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8','Accept-Language':'ko-KR,ko;q=0.9,en;q=0.7','Cache-Control':'no-cache','Pragma':'no-cache','Referer':base+'/'}
@@ -1945,8 +2017,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.3')
-st.caption('Build: V18.3 · 롯데ON 원본 데이터 진단 + 가격/상품명 정밀 파싱')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.4')
+st.caption('Build: V18.4 · 롯데ON 실제 필드 고정 파싱 + 가격/상품명/링크 정밀 추출')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2098,7 +2170,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V18.3')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V18.4')
     st.caption('현재는 아디다스·나이키 신발 후보의 상품명/품번/가격/할인율/링크를 자동 수집합니다. 다음 단계에서 POIZON·KREAM·쿠팡 자동비교를 연결합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -2170,6 +2242,11 @@ with tl:
         pick=st.selectbox('원본 확인할 품번',[x['품번후보'] for x in drows],key='lotte_diag_pick')
         picked=next((x['원본주변'] for x in drows if x['품번후보']==pick),'')
         st.code(picked,language='json')
+        extracted=_lotteon_diag_extract_fields(picked,diag_brand,pick)
+        st.markdown('#### ✅ V18.4 실제 필드 추출 결과')
+        st.dataframe(pd.DataFrame([extracted]),width='stretch',hide_index=True)
+        if extracted.get('현재가'):
+            st.caption(f"확인값 → 상품명: {extracted.get('상품명','-')} / 현재가: {int(extracted.get('현재가') or 0):,}원 / 정상가: {int(extracted.get('정상가') or 0):,}원 / 할인율: {extracted.get('할인율(%)','-')}%")
         keys=st.session_state.get('lotte_diag_keys',[]) or []
         if keys:
             st.caption('원문에서 발견한 가격/상품 관련 키 후보: '+', '.join(keys[:60]))
