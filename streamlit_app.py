@@ -2044,8 +2044,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.6')
-st.caption('Build: V18.6 · 롯데ON 1개 테스트 → POIZON 공식 API 직결 + KREAM 입력 준비')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.7')
+st.caption('Build: V18.7 · 롯데ON 매입가 → POIZON 공식 API → 사이즈별 즉시 매입판정 + KREAM 교차검증')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2329,7 +2329,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.6')
+        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.7')
         st.caption('후보 1개를 골라 롯데 매입가를 고정하고 POIZON 공식 API까지 바로 연결합니다. KREAM은 다음 탭에서 휴대폰 즉시판매가만 입력하면 자동비교가 완성됩니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
@@ -2375,7 +2375,62 @@ with tl:
                     st.markdown(f'##### ✅ {_ready} POIZON 조회 결과 미리보기')
                     _cols=[c for c in ['size','eu_size','sku_id','poizon_global_min_price','poizon_global_avg_price','poizon_30d_sales'] if c in _pdf.columns]
                     st.dataframe(_pdf[_cols].head(20),width='stretch',hide_index=True)
-                    st.caption('이제 ③ KREAM 가져오기에서 같은 사이즈의 즉시판매가를 입력한 뒤 ④ 자동 비교로 가면 됩니다.')
+
+                    # V18.7: POIZON official API alone can now produce a provisional field buying decision.
+                    # KREAM remains the second-market cross-check, not a prerequisite for the first decision.
+                    _base_all=load_db()
+                    _base_one=_base_all[_base_all['model'].astype(str).str.strip()==str(_ready).strip()].copy()
+                    if len(_base_one):
+                        _cmp=compute_compare(_base_one,kream=None,poizon=_pdf.copy())
+                        if isinstance(_cmp,pd.DataFrame) and len(_cmp):
+                            st.markdown('##### 🎯 V18.7 POIZON 즉시 매입판정')
+                            st.caption('롯데 매입가와 POIZON 공식 가격·30일 판매량만으로 1차 판정합니다. KREAM은 다음 단계에서 교차검증합니다.')
+                            _rows=[]
+                            for _,_r in _cmp.iterrows():
+                                _profit=_r.get('poizon_profit')
+                                _roi=_r.get('poizon_roi')
+                                _sales=_r.get('poizon_30d_sales')
+                                _price=_r.get('poizon_buyer_price')
+                                _raw_grade=str(_r.get('판정',''))
+                                if '강력매입' in _raw_grade or '매입추천' in _raw_grade:
+                                    _field_grade='🟢 BEST'
+                                elif '1개 테스트' in _raw_grade:
+                                    _field_grade='🟠 1개 테스트'
+                                else:
+                                    _field_grade='🔴 PASS'
+                                _rows.append({
+                                    '판정':_field_grade,
+                                    '사이즈':str(_r.get('size','')),
+                                    'EU':str(_r.get('eu_size','') or ''),
+                                    '롯데 매입가':_r.get('buy_price_num'),
+                                    'POIZON 기준가':_price,
+                                    '예상 순이익':_profit,
+                                    'ROI(%)':_roi,
+                                    '30일 판매':_sales,
+                                    '추천수량':int(_r.get('추천구매수량',0) or 0),
+                                    '판정이유':str(_r.get('판정이유','')),
+                                })
+                            _judge=pd.DataFrame(_rows)
+                            _rank={'🟢 BEST':0,'🟠 1개 테스트':1,'🔴 PASS':2}
+                            _judge['_rank']=_judge['판정'].map(_rank).fillna(9)
+                            _judge=_judge.sort_values(['_rank','예상 순이익','30일 판매'],ascending=[True,False,False],na_position='last').drop(columns=['_rank'])
+                            st.dataframe(
+                                _judge, width='stretch', hide_index=True,
+                                column_config={
+                                    '롯데 매입가':st.column_config.NumberColumn(format='%,d원'),
+                                    'POIZON 기준가':st.column_config.NumberColumn(format='%,d원'),
+                                    '예상 순이익':st.column_config.NumberColumn(format='%,d원'),
+                                    'ROI(%)':st.column_config.NumberColumn(format='%.1f%%'),
+                                    '30일 판매':st.column_config.NumberColumn(format='%d건'),
+                                }
+                            )
+                            _actionable=_judge[_judge['판정'].isin(['🟢 BEST','🟠 1개 테스트'])]
+                            if len(_actionable):
+                                _b=_actionable.iloc[0]
+                                st.success(f"🏆 1순위: KR {_b['사이즈']} · {_b['판정']} · 예상 순익 {float(_b['예상 순이익']):,.0f}원 · ROI {float(_b['ROI(%)']):.1f}% · 30일 {int(float(_b['30일 판매'])) if pd.notna(_b['30일 판매']) else 0}건")
+                            else:
+                                st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 가격이 더 내려가거나 판매가가 올라갈 때 다시 확인하세요.')
+                    st.caption('다음은 ③ KREAM 가져오기에서 같은 사이즈의 즉시판매가를 넣어 POIZON 판정을 교차검증하면 됩니다.')
 
         a1,a2=st.columns(2)
         if a1.button('➕ 선택상품을 우리 비교목록에 넣기',width='stretch',key='lotte_add_selected'):
