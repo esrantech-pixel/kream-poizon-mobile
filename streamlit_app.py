@@ -8,7 +8,7 @@ import pytesseract
 from openai import OpenAI
 import base64
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.8.3', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V18.8.4', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -771,56 +771,71 @@ def compute_compare(base, kream=None, poizon=None):
         best_roi.append(roi)
         best_sales.append(sales)
 
+        # V18.8.4 실전 판정 기준
+        # 강력매입: 순익 >= 20,000원 AND ROI >= 25%
+        # 매입추천: 순익 >= 10,000원 AND ROI >= 20%
+        # 관찰:     순익 >= 5,000원  AND ROI >= 15%
+        # 그 미만은 PASS
         if profit <= 0:
             grade.append('🔴 PASS')
             reasons.append('예상 손실')
             buy_qty.append(0)
             continue
 
-        # Unknown/zero rotation -> never automatic buy recommendation.
         sales_num = int(sales) if sales is not None and pd.notna(sales) else 0
-        min_sales = max(int(s['min_30d_sales']), 1)
+        roi_num = float(roi) if roi is not None and pd.notna(roi) else None
 
-        fail = []
-        if profit < s['target_profit']:
-            fail.append(f"순익 {profit:,.0f}원 < 기준 {s['target_profit']:,.0f}원")
-        if roi is None:
-            fail.append('ROI 데이터 없음')
-        elif roi < s['target_roi']:
-            fail.append(f"ROI {roi:.1f}% < 기준 {s['target_roi']:.1f}%")
-
-        if fail:
-            grade.append('🟡 관찰')
-            reasons.append(' / '.join(fail))
+        if roi_num is None:
+            grade.append('🔴 PASS')
+            reasons.append('ROI 데이터 없음')
             buy_qty.append(0)
             continue
 
+        # 수익성 자체가 부족하면 회전율과 관계없이 PASS
+        if profit < 5000 or roi_num < 15:
+            grade.append('🔴 PASS')
+            reasons.append(
+                f'수익성 미달 · 순익 {profit:,.0f}원 / ROI {roi_num:.1f}% '
+                f'(최소 5,000원·15%)'
+            )
+            buy_qty.append(0)
+            continue
+
+        # 판매량 미확인은 자동매입 금지
         if sales_num <= 0:
             grade.append('🟡 관찰')
-            reasons.append(f'{platform} 수익성은 확인됐으나 최근 30일 판매량 미확인')
+            reasons.append(
+                f'수익성은 확인됐으나 최근 30일 판매량 미확인 · '
+                f'순익 {profit:,.0f}원 / ROI {roi_num:.1f}%'
+            )
             buy_qty.append(0)
             continue
 
-        strong_profit = profit >= s['target_profit'] * 1.5
-        strong_roi = roi is not None and roi >= max(s['target_roi'] + 20, 40)
-        strong_sales = sales_num >= max(min_sales + 1, 3)
-
-        if strong_profit and strong_roi and strong_sales:
+        if profit >= 20000 and roi_num >= 25:
             grade.append('🟢🟢 강력매입')
-            reasons.append('고수익·고ROI·회전 모두 충족')
+            reasons.append(
+                f'강력 기준 충족 · 순익 {profit:,.0f}원 / ROI {roi_num:.1f}% / '
+                f'30일판매 {sales_num}건'
+            )
             qty = max(2, min(5, int(math.ceil(sales_num / 2))))
             buy_qty.append(qty)
-        elif sales_num >= min_sales:
+        elif profit >= 10000 and roi_num >= 20:
             grade.append('🟢 매입추천')
-            reasons.append('수익·ROI·회전 기준 충족')
+            reasons.append(
+                f'매입 기준 충족 · 순익 {profit:,.0f}원 / ROI {roi_num:.1f}% / '
+                f'30일판매 {sales_num}건'
+            )
             buy_qty.append(2 if sales_num >= 4 else 1)
-        elif sales_num >= 1:
-            grade.append('🟠 1개 테스트')
-            reasons.append(f'수익성은 충족하나 최근 30일 판매 {sales_num}건으로 회전 낮음')
-            buy_qty.append(1)
-        else:
+        elif profit >= 5000 and roi_num >= 15:
             grade.append('🟡 관찰')
-            reasons.append('수익성은 충족하나 판매량 데이터 부족')
+            reasons.append(
+                f'관찰 기준 · 순익 {profit:,.0f}원 / ROI {roi_num:.1f}% / '
+                f'30일판매 {sales_num}건'
+            )
+            buy_qty.append(0)
+        else:
+            grade.append('🔴 PASS')
+            reasons.append('실전 수익 기준 미달')
             buy_qty.append(0)
 
     df['best_platform'] = best
@@ -2123,8 +2138,8 @@ def load_lotteon_db():
             pass
     return pd.DataFrame(columns=['선택','브랜드','상품명','품번','현재가','정상가','할인율(%)','링크','수집상태'])
 
-st.title('KREAM · POIZON · COUPANG 소싱 V18.8.3')
-st.caption('Build: V18.8.3 · POIZON payout Series 안전처리 + KR사이즈 정확매칭 + KREAM 가격 안전검사')
+st.title('KREAM · POIZON · COUPANG 소싱 V18.8.4')
+st.caption('Build: V18.8.4 · 실전 순이익/ROI 판정 기준 현실화 + 기존 안전검사 유지')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2407,7 +2422,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.8.3')
+        st.markdown('#### 🧪 1개 상품 끝까지 테스트 · V18.8.4')
         st.caption('후보 1개를 골라 롯데 매입가를 고정하고 POIZON 공식 API까지 바로 연결합니다. KREAM은 다음 탭에서 휴대폰 즉시판매가만 입력하면 자동비교가 완성됩니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
@@ -2472,7 +2487,7 @@ with tl:
                     if len(_base_one):
                         _cmp=compute_compare(_base_one,kream=None,poizon=_pdf_judge.copy())
                         if isinstance(_cmp,pd.DataFrame) and len(_cmp):
-                            st.markdown('##### 🎯 V18.8.3 POIZON 유효가격 매입판정')
+                            st.markdown('##### 🎯 V18.8.4 POIZON 유효가격 매입판정')
                             st.caption('롯데 매입가와 POIZON 공식 가격·30일 판매량만으로 1차 판정합니다. KREAM은 다음 단계에서 교차검증합니다.')
                             _rows=[]
                             for _,_r in _cmp.iterrows():
@@ -2520,7 +2535,7 @@ with tl:
                             else:
                                 st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 판매량 없는 POIZON 가격은 수익 계산에서 제외했습니다.')
 
-                    st.markdown('##### 🔁 V18.8.3 KREAM 자동 교차검증')
+                    st.markdown('##### 🔁 V18.8.4 KREAM 자동 교차검증')
                     st.caption('같은 품번을 KREAM에서 자동 매칭해 즉시판매가(최고 매입입찰)·30일 체결을 가져오고 POIZON과 같은 사이즈로 비교합니다.')
                     if st.button('🔎 KREAM 자동조회 + POIZON 교차비교', type='primary', width='stretch', key='lotte_v188_kream_auto'):
                         try:
