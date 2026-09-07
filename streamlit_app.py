@@ -48,7 +48,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V19.3.2', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.0', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -2558,8 +2558,8 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V19.3.2')
-st.caption('Build: V19.3.2 · KREAM 강제 시간제한 + 자동건너뛰기 + POIZON 결과 보존')
+st.title('KREAM · POIZON · COUPANG 소싱 V20.0')
+st.caption('Build: V20.0 · 오늘 살 것 자동선정 + 예산배분 + BEST 사이즈/판매처/수익/회전 통합')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -3919,142 +3919,332 @@ with t5:
 ''')
 
 with t6:
-    st.subheader('오늘 살 것 V11.0')
-    st.caption('저장한 실전 후보를 예산 안에서 구매 우선순위로 정리합니다. 실제 매입 직전에는 플랫폼 가격과 재고를 한 번 더 확인하세요.')
+    st.subheader('🛒 오늘 살 것 V20.0')
+    st.caption(
+        '저장 후보 + 현재 롯데 자동소싱 결과를 한곳에 모아 '
+        '수익성·ROI·30일 판매량·판정등급을 함께 보고 예산 안에서 오늘 살 상품을 자동선정합니다. '
+        '실제 결제 직전에는 판매가와 재고를 한 번 더 확인하세요.'
+    )
 
     candidate_path = DATA_DIR / 'sourcing_candidates.csv'
 
-    if not candidate_path.exists():
-        st.info('아직 저장된 후보가 없습니다. ④ 자동 비교에서 강력매입/매입추천/1개 테스트 후보를 먼저 저장해 주세요.')
-    else:
-        try:
-            saved = pd.read_csv(candidate_path)
+    try:
+        # =========================================================
+        # 1) 후보 통합: 저장 후보 + 현재 세션 롯데/POIZON/KREAM 결과
+        # =========================================================
+        candidate_frames = []
 
-            if saved.empty:
-                st.info('아직 저장된 후보가 없습니다.')
-            else:
-                numeric_cols = [
-                    '추천구매수량','현재매입가','권장최대매입가',
-                    '최고예상순익','최고ROI(%)','추천처30일판매'
-                ]
-                for c in numeric_cols:
-                    if c in saved.columns:
-                        saved[c] = pd.to_numeric(saved[c], errors='coerce')
+        if candidate_path.exists():
+            try:
+                _saved = pd.read_csv(candidate_path)
+                if len(_saved):
+                    if '소싱처' not in _saved.columns:
+                        _saved['소싱처'] = '저장후보'
+                    candidate_frames.append(_saved)
+            except Exception as e:
+                st.warning(f'저장 후보 읽기 실패: {e}')
 
-                # 최신 후보만 유지
-                key_cols = [c for c in ['모델','KR사이즈','EU사이즈','POIZON SKU'] if c in saved.columns]
-                if key_cols and '저장일시' in saved.columns:
-                    saved = saved.sort_values('저장일시').drop_duplicates(subset=key_cols, keep='last')
+        # V19.3.x POIZON+KREAM 교차결과를 V20 공통 후보 형식으로 변환
+        _xout = st.session_state.get('v193_kream_cross_result', pd.DataFrame())
+        if isinstance(_xout, pd.DataFrame) and len(_xout):
+            _x = _xout.copy()
+            _mapped = pd.DataFrame({
+                '판정': _x.get('최종판정'),
+                '상품명': _x.get('상품명'),
+                '모델': _x.get('품번'),
+                'KR사이즈': _x.get('BEST사이즈'),
+                'EU사이즈': '',
+                '현재매입가': _x.get('롯데매입가'),
+                '권장최대매입가': _x.get('권장최대매입가'),
+                '추천판매처': _x.get('추천판매처'),
+                '최고예상순익': _x.get('예상순이익'),
+                '최고ROI(%)': _x.get('ROI(%)'),
+                '추천처30일판매': _x.get('30일판매'),
+                '추천구매수량': _x.get('추천수량'),
+                '매입가이드': _x.get('이유'),
+                '소싱처': '롯데ON',
+                '교차검증상태': _x.get('교차검증상태'),
+                '상품URL': _x.get('롯데상품'),
+                '저장일시': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'),
+            })
+            candidate_frames.append(_mapped)
 
-                rank_order = {
-                    '🟢🟢 강력매입': 1,
-                    '🟢 매입추천': 2,
-                    '🟠 1개 테스트': 3,
-                    '🟡 관찰': 4
-                }
-                saved['_등급순위'] = saved['판정'].map(rank_order).fillna(9)
-                saved['_순익정렬'] = pd.to_numeric(saved.get('최고예상순익'), errors='coerce').fillna(-1)
-                saved['_ROI정렬'] = pd.to_numeric(saved.get('최고ROI(%)'), errors='coerce').fillna(-999)
-                saved['_판매정렬'] = pd.to_numeric(saved.get('추천처30일판매'), errors='coerce').fillna(0)
+        # KREAM 교차결과가 없을 때만 POIZON 1차결과를 현재 후보로 사용
+        if not (isinstance(_xout, pd.DataFrame) and len(_xout)):
+            _bout = st.session_state.get('v191_lotte_batch_result', pd.DataFrame())
+            if isinstance(_bout, pd.DataFrame) and len(_bout):
+                _b = _bout.copy()
+                _mapped_b = pd.DataFrame({
+                    '판정': _b.get('최종판정'),
+                    '상품명': _b.get('상품명'),
+                    '모델': _b.get('품번'),
+                    'KR사이즈': _b.get('BEST사이즈'),
+                    'EU사이즈': '',
+                    '현재매입가': _b.get('롯데매입가'),
+                    '권장최대매입가': _b.get('권장최대매입가'),
+                    '추천판매처': 'POIZON 1차',
+                    '최고예상순익': _b.get('예상순이익'),
+                    '최고ROI(%)': _b.get('ROI(%)'),
+                    '추천처30일판매': _b.get('30일판매'),
+                    '추천구매수량': _b.get('추천수량'),
+                    '매입가이드': _b.get('이유'),
+                    '소싱처': '롯데ON',
+                    '교차검증상태': 'KREAM 미확인',
+                    '상품URL': _b.get('상품URL'),
+                    '저장일시': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M'),
+                })
+                candidate_frames.append(_mapped_b)
 
-                saved = saved.sort_values(
-                    ['_등급순위','_순익정렬','_ROI정렬','_판매정렬'],
-                    ascending=[True,False,False,False]
-                ).drop(columns=['_등급순위','_순익정렬','_ROI정렬','_판매정렬'])
+        if not candidate_frames:
+            st.info(
+                '아직 오늘 판단할 후보가 없습니다. '
+                '🛍️ 롯데 자동소싱에서 POIZON 일괄판정을 돌리거나, '
+                '④ 자동 비교에서 후보를 저장해 주세요.'
+            )
+        else:
+            all_candidates = pd.concat(candidate_frames, ignore_index=True, sort=False)
 
-                if '추천구매수량' not in saved.columns:
-                    saved['추천구매수량'] = 0
-                saved['추천구매수량'] = pd.to_numeric(saved['추천구매수량'], errors='coerce').fillna(0).astype(int)
+            # 필수 컬럼 보정
+            for c, default in {
+                '판정':'', '상품명':'', '모델':'', 'KR사이즈':'', 'EU사이즈':'',
+                '현재매입가':0, '권장최대매입가':None, '추천판매처':'',
+                '최고예상순익':0, '최고ROI(%)':-999, '추천처30일판매':0,
+                '추천구매수량':0, '매입가이드':'', '소싱처':'',
+                '교차검증상태':'', '상품URL':'', '저장일시':''
+            }.items():
+                if c not in all_candidates.columns:
+                    all_candidates[c] = default
 
-                # ---------------------------
-                # 오늘 예산 / 필터
-                # ---------------------------
-                st.markdown('### 오늘 장보기 조건')
-                c_budget, c_roi, c_profit = st.columns(3)
-                with c_budget:
-                    today_budget = st.number_input('오늘 매입 예산(원)', min_value=0, value=300000, step=50000, key='today_budget_v10')
-                with c_roi:
-                    today_min_roi = st.number_input('오늘 최소 ROI(%)', min_value=-100.0, value=float(st.session_state.settings['target_roi']), step=1.0, key='today_min_roi_v10')
-                with c_profit:
-                    today_min_profit = st.number_input('오늘 최소 순익(원)', min_value=-100000, value=int(st.session_state.settings['target_profit']), step=1000, key='today_min_profit_v10')
+            # 숫자형 정리
+            for c in [
+                '현재매입가','권장최대매입가','최고예상순익',
+                '최고ROI(%)','추천처30일판매','추천구매수량'
+            ]:
+                all_candidates[c] = pd.to_numeric(all_candidates[c], errors='coerce')
 
-                working = saved.copy()
-                working['현재매입가'] = pd.to_numeric(working.get('현재매입가'), errors='coerce').fillna(0)
-                working['최고예상순익'] = pd.to_numeric(working.get('최고예상순익'), errors='coerce').fillna(0)
-                working['최고ROI(%)'] = pd.to_numeric(working.get('최고ROI(%)'), errors='coerce').fillna(-999)
-                working['추천처30일판매'] = pd.to_numeric(working.get('추천처30일판매'), errors='coerce').fillna(0)
+            all_candidates['현재매입가'] = all_candidates['현재매입가'].fillna(0)
+            all_candidates['최고예상순익'] = all_candidates['최고예상순익'].fillna(0)
+            all_candidates['최고ROI(%)'] = all_candidates['최고ROI(%)'].fillna(-999)
+            all_candidates['추천처30일판매'] = all_candidates['추천처30일판매'].fillna(0)
+            all_candidates['추천구매수량'] = all_candidates['추천구매수량'].fillna(0).astype(int)
 
-                # 실제 구매 후보만 남김
-                working = working[
-                    working['판정'].isin(['🟢🟢 강력매입','🟢 매입추천','🟠 1개 테스트']) &
-                    (working['최고ROI(%)'] >= today_min_roi) &
-                    (working['최고예상순익'] >= today_min_profit) &
-                    (working['현재매입가'] > 0) &
-                    (working['추천구매수량'] > 0)
-                ].copy()
+            # 같은 모델+사이즈는 최신/현재 세션 결과 우선
+            dedupe_keys = [c for c in ['모델','KR사이즈'] if c in all_candidates.columns]
+            if dedupe_keys:
+                all_candidates = all_candidates.drop_duplicates(
+                    subset=dedupe_keys, keep='last'
+                ).reset_index(drop=True)
 
-                # 예산 안에서 상위 후보부터 추천 수량을 채움
+            # =========================================================
+            # 2) 오늘 장보기 조건
+            # =========================================================
+            st.markdown('### 🎯 오늘 장보기 조건')
+            c_budget, c_roi, c_profit, c_sales = st.columns(4)
+
+            with c_budget:
+                today_budget = st.number_input(
+                    '오늘 매입 예산(원)',
+                    min_value=0, value=300000, step=50000,
+                    key='today_budget_v20'
+                )
+            with c_roi:
+                today_min_roi = st.number_input(
+                    '최소 ROI(%)',
+                    min_value=-100.0, value=15.0, step=1.0,
+                    key='today_min_roi_v20'
+                )
+            with c_profit:
+                today_min_profit = st.number_input(
+                    '최소 1개 순익(원)',
+                    min_value=-100000, value=10000, step=1000,
+                    key='today_min_profit_v20'
+                )
+            with c_sales:
+                today_min_sales = st.number_input(
+                    '최소 30일 판매량',
+                    min_value=0, value=1, step=1,
+                    key='today_min_sales_v20'
+                )
+
+            working = all_candidates.copy()
+
+            # 실제 구매 가능 후보
+            working = working[
+                working['판정'].isin(['🟢🟢 강력매입','🟢 매입추천','🟠 1개 테스트']) &
+                (working['현재매입가'] > 0) &
+                (working['추천구매수량'] > 0) &
+                (working['최고예상순익'] >= float(today_min_profit)) &
+                (working['최고ROI(%)'] >= float(today_min_roi)) &
+                (working['추천처30일판매'] >= int(today_min_sales))
+            ].copy()
+
+            # =========================================================
+            # 3) V20 실전점수: 판정 + 수익 + ROI + 회전
+            # =========================================================
+            grade_points = {
+                '🟢🟢 강력매입': 40.0,
+                '🟢 매입추천': 34.0,
+                '🟠 1개 테스트': 28.0,
+            }
+
+            if len(working):
+                working['_grade'] = working['판정'].map(grade_points).fillna(0.0)
+
+                # 각 지표를 과도하게 한쪽으로 몰리지 않게 cap
+                working['_profit_score'] = (
+                    (working['최고예상순익'].clip(lower=0) / 30000.0 * 20.0)
+                    .clip(upper=20.0)
+                )
+                working['_roi_score'] = (
+                    (working['최고ROI(%)'].clip(lower=0) / 40.0 * 20.0)
+                    .clip(upper=20.0)
+                )
+                working['_sales_score'] = (
+                    (working['추천처30일판매'].clip(lower=0) / 10.0 * 20.0)
+                    .clip(upper=20.0)
+                )
+
+                working['실전점수'] = (
+                    working['_grade'] +
+                    working['_profit_score'] +
+                    working['_roi_score'] +
+                    working['_sales_score']
+                ).round(1)
+
+                # 사용자에게 보여줄 최종 행동 문구
+                working['오늘판정'] = working['판정'].map({
+                    '🟢🟢 강력매입': '🟢 오늘 매입',
+                    '🟢 매입추천': '🟢 오늘 매입',
+                    '🟠 1개 테스트': '🟠 1개 테스트',
+                }).fillna('🔴 제외')
+
+                # 높은 실전점수 → 순익 → ROI → 판매량 순
+                working = working.sort_values(
+                    ['실전점수','최고예상순익','최고ROI(%)','추천처30일판매'],
+                    ascending=[False,False,False,False]
+                ).reset_index(drop=True)
+
+                # =====================================================
+                # 4) 예산 자동배분
+                # =====================================================
                 remaining = int(today_budget)
                 budget_qty = []
+
                 for _, r in working.iterrows():
                     unit = int(r['현재매입가']) if pd.notna(r['현재매입가']) else 0
                     want = int(r['추천구매수량']) if pd.notna(r['추천구매수량']) else 0
+
+                    # 1개 테스트는 반드시 최대 1개
+                    if str(r.get('판정','')) == '🟠 1개 테스트':
+                        want = min(want, 1)
+
                     if unit <= 0 or want <= 0 or remaining < unit:
                         q = 0
                     else:
                         q = min(want, remaining // unit)
+
                     budget_qty.append(int(q))
                     remaining -= int(q) * unit
 
                 working['오늘구매수량'] = budget_qty
-                working = working[working['오늘구매수량'] > 0].copy()
                 working['예상매입금액'] = working['현재매입가'] * working['오늘구매수량']
                 working['예상총순익'] = working['최고예상순익'] * working['오늘구매수량']
-                working.insert(0, '우선순위', range(1, len(working)+1))
 
-                total_cost = int(working['예상매입금액'].sum()) if len(working) else 0
-                total_profit = int(working['예상총순익'].sum()) if len(working) else 0
-                total_qty = int(working['오늘구매수량'].sum()) if len(working) else 0
+                # 구매대상 / 예산 때문에 보류된 대상 구분
+                working['예산판정'] = working['오늘구매수량'].map(
+                    lambda q: '✅ 예산반영' if int(q) > 0 else '⏸ 예산대기'
+                )
+
+                buy_list = working[working['오늘구매수량'] > 0].copy()
+                buy_list.insert(0, '우선순위', range(1, len(buy_list)+1))
+
+                total_cost = int(buy_list['예상매입금액'].sum()) if len(buy_list) else 0
+                total_profit = int(buy_list['예상총순익'].sum()) if len(buy_list) else 0
+                total_qty = int(buy_list['오늘구매수량'].sum()) if len(buy_list) else 0
                 remain_budget = max(int(today_budget) - total_cost, 0)
                 blended_roi = (total_profit / total_cost * 100) if total_cost > 0 else 0
 
-                c1,c2,c3,c4 = st.columns(4)
-                c1.metric('오늘 구매수량', f'{total_qty}개')
-                c2.metric('예상 총 매입금액', f'{total_cost:,.0f}원')
-                c3.metric('예상 총 순익', f'{total_profit:,.0f}원')
-                c4.metric('예산 잔액', f'{remain_budget:,.0f}원')
+                # =====================================================
+                # 5) 한눈에 보는 오늘 결론
+                # =====================================================
+                st.markdown('### ✅ 오늘 결론')
+                m1,m2,m3,m4,m5 = st.columns(5)
+                m1.metric('조건 통과 후보', f'{len(working)}개')
+                m2.metric('오늘 구매수량', f'{total_qty}개')
+                m3.metric('예상 매입금액', f'{total_cost:,.0f}원')
+                m4.metric('예상 총 순익', f'{total_profit:,.0f}원')
+                m5.metric('예산 잔액', f'{remain_budget:,.0f}원')
 
                 if total_cost > 0:
-                    st.success(f'예산 기준 예상 종합 ROI {blended_roi:.1f}% · 아래 순서대로 매장에서 재고를 확인하세요.')
-                else:
-                    st.warning('현재 저장 후보 중 오늘 기준을 충족하는 구매 대상이 없습니다.')
+                    st.success(
+                        f'예상 종합 ROI {blended_roi:.1f}% · '
+                        f'실전점수와 예산을 함께 반영한 순서입니다.'
+                    )
 
-                st.markdown('### 🛒 실전 장보기 리스트')
+                    top = buy_list.iloc[0]
+                    top_sales = int(top['추천처30일판매']) if pd.notna(top['추천처30일판매']) else 0
+                    st.info(
+                        f"🏆 오늘 1순위: {top.get('상품명','')} / {top.get('모델','')} / "
+                        f"KR {top.get('KR사이즈','')} · {top.get('오늘판정','')} · "
+                        f"{top.get('추천판매처','')} · 매입 {top.get('현재매입가',0):,.0f}원 · "
+                        f"1개 순익 {top.get('최고예상순익',0):,.0f}원 · "
+                        f"ROI {top.get('최고ROI(%)',0):.1f}% · 30일 {top_sales}건 · "
+                        f"추천 {int(top.get('오늘구매수량',0))}개"
+                    )
+                else:
+                    st.warning('현재 조건과 예산을 동시에 충족하는 오늘 구매 대상이 없습니다.')
+
+                # =====================================================
+                # 6) 오늘 실제 구매 리스트
+                # =====================================================
+                st.markdown('### 🛒 오늘 실제 구매 리스트')
+
                 show_cols = [c for c in [
-                    '우선순위','판정','상품명','모델','KR사이즈','EU사이즈',
-                    '오늘구매수량','현재매입가','예상매입금액',
+                    '우선순위','오늘판정','실전점수','소싱처','상품명','모델',
+                    'KR사이즈','EU사이즈','오늘구매수량',
+                    '현재매입가','예상매입금액',
                     '추천판매처','최고예상순익','예상총순익',
-                    '최고ROI(%)','추천처30일판매','권장최대매입가','매입가이드','저장일시'
-                ] if c in working.columns]
+                    '최고ROI(%)','추천처30일판매','권장최대매입가',
+                    '교차검증상태','매입가이드','상품URL'
+                ] if c in buy_list.columns]
 
                 st.dataframe(
-                    working[show_cols] if len(working) else pd.DataFrame(columns=show_cols),
+                    buy_list[show_cols] if len(buy_list) else pd.DataFrame(columns=show_cols),
                     width='stretch',
-                    height=500,
+                    height=480,
+                    hide_index=True,
                     column_config={
+                        '실전점수': st.column_config.NumberColumn(format='%.1f'),
                         '현재매입가': st.column_config.NumberColumn(format='%,.0f원'),
                         '예상매입금액': st.column_config.NumberColumn(format='%,.0f원'),
                         '최고예상순익': st.column_config.NumberColumn(format='%,.0f원'),
                         '예상총순익': st.column_config.NumberColumn(format='%,.0f원'),
                         '권장최대매입가': st.column_config.NumberColumn(format='%,.0f원'),
                         '최고ROI(%)': st.column_config.NumberColumn(format='%.1f%%'),
+                        '추천처30일판매': st.column_config.NumberColumn(format='%d건'),
+                        '상품URL': st.column_config.LinkColumn('상품', display_text='열기'),
                     }
                 )
 
+                # 예산 때문에 못 담은 후보도 따로 보여줌
+                waiting = working[working['오늘구매수량'] == 0].copy()
+                if len(waiting):
+                    with st.expander(f'⏸ 조건은 통과했지만 예산 때문에 대기 중인 후보 {len(waiting)}개'):
+                        wait_cols = [c for c in [
+                            '오늘판정','실전점수','상품명','모델','KR사이즈',
+                            '현재매입가','추천판매처','최고예상순익',
+                            '최고ROI(%)','추천처30일판매','추천구매수량'
+                        ] if c in waiting.columns]
+                        st.dataframe(
+                            waiting[wait_cols],
+                            width='stretch',
+                            hide_index=True
+                        )
+
                 # 판매처별 묶음
-                if len(working) and '추천판매처' in working.columns:
-                    st.markdown('### 판매처별 요약')
-                    by_platform = working.groupby('추천판매처', dropna=False).agg(
+                if len(buy_list):
+                    st.markdown('### 📦 판매처별 구매 요약')
+                    by_platform = buy_list.groupby('추천판매처', dropna=False).agg(
                         상품종류=('모델','count'),
                         구매수량=('오늘구매수량','sum'),
                         예상매입금액=('예상매입금액','sum'),
@@ -4063,26 +4253,58 @@ with t6:
                     st.dataframe(
                         by_platform,
                         width='stretch',
+                        hide_index=True,
                         column_config={
                             '예상매입금액': st.column_config.NumberColumn(format='%,.0f원'),
                             '예상총순익': st.column_config.NumberColumn(format='%,.0f원'),
                         }
                     )
 
-                if st.button('📲 오늘 장보기 리스트를 텔레그램으로 전송', width='stretch', key='telegram_today_v113'):
-                    ok, msg = send_telegram_message(candidate_telegram_text(working, '🛒 오늘 장보기 리스트'))
+                # 텔레그램 / CSV
+                if st.button(
+                    '📲 오늘 살 것 리스트를 텔레그램으로 전송',
+                    width='stretch',
+                    key='telegram_today_v20'
+                ):
+                    ok, msg = send_telegram_message(
+                        candidate_telegram_text(buy_list, '🛒 V20 오늘 살 것')
+                    )
                     (st.success if ok else st.error)(msg)
 
                 st.download_button(
-                    '📥 오늘 장보기 리스트 CSV 저장',
-                    (working[show_cols] if len(working) else pd.DataFrame(columns=show_cols)).to_csv(index=False).encode('utf-8-sig'),
-                    'today_buy_list_v11.csv',
+                    '📥 오늘 살 것 CSV 저장',
+                    (buy_list[show_cols] if len(buy_list) else pd.DataFrame(columns=show_cols))
+                    .to_csv(index=False).encode('utf-8-sig'),
+                    'today_buy_list_v20.csv',
                     'text/csv',
                     width='stretch'
                 )
 
-                st.info('후보 저장 후 가격이 변할 수 있습니다. 실제 결제 직전 KREAM/POIZON 가격과 매장 재고를 다시 확인하세요.')
+                st.info(
+                    'V20의 자동선정은 의사결정 보조입니다. '
+                    '실제 결제 직전에는 롯데/매입처 재고와 최종 결제가, '
+                    'POIZON/KREAM의 최신 판매가를 다시 확인하세요.'
+                )
 
-        except Exception as e:
-            st.error(f'후보목록을 읽지 못했습니다: {e}')
+            else:
+                st.warning(
+                    '현재 후보 중 오늘 기준을 충족하는 상품이 없습니다. '
+                    '최소 ROI/순익/판매량 조건을 낮추거나 새 상품을 소싱해 보세요.'
+                )
+
+                # 왜 탈락했는지 볼 수 있도록 원본 후보 일부 표시
+                with st.expander(f'전체 후보 {len(all_candidates)}개 확인'):
+                    preview_cols = [c for c in [
+                        '판정','소싱처','상품명','모델','KR사이즈',
+                        '현재매입가','추천판매처','최고예상순익',
+                        '최고ROI(%)','추천처30일판매','추천구매수량'
+                    ] if c in all_candidates.columns]
+                    st.dataframe(
+                        all_candidates[preview_cols],
+                        width='stretch',
+                        hide_index=True
+                    )
+
+    except Exception as e:
+        st.error(f'V20 오늘 살 것 계산 중 오류가 발생했습니다: {e}')
 
