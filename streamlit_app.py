@@ -48,7 +48,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.10', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.11', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -2545,6 +2545,150 @@ def _lotteon_fetch_raw(brand='아디다스'):
     except Exception as e:
         return '', url, f'접속 실패: {e}'
 
+
+def _lotteon_http_get(url, timeout=25):
+    """롯데ON 공개 상품/검색 페이지를 일반 브라우저 요청으로 읽는다. 차단 시 우회하지 않는다."""
+    url = str(url or '').strip()
+    if not url:
+        return '', 'URL 없음'
+    headers = {
+        'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+        'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language':'ko-KR,ko;q=0.9,en;q=0.7',
+        'Cache-Control':'no-cache',
+        'Pragma':'no-cache',
+        'Referer':'https://www.lotteon.com/'
+    }
+    try:
+        r = requests.Session().get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        if r.status_code != 200:
+            return '', f'HTTP {r.status_code}'
+        return r.text or '', f'HTTP {r.status_code} · {len(r.text or ""):,}자'
+    except Exception as e:
+        return '', f'접속 실패: {e}'
+
+
+def _lotteon_valid_kr_shoe_size(n):
+    try:
+        x = int(float(n))
+    except Exception:
+        return False
+    return 200 <= x <= 355 and x % 5 == 0
+
+
+def _lotteon_extract_sizes_from_product_html(html, model=''):
+    """
+    롯데ON 원문에서 신발 사이즈로 보이는 KR 값을 보수적으로 추출한다.
+    가격/날짜 숫자 오탐을 줄이기 위해 size/사이즈/option 문맥이 있는 값만 사용한다.
+    """
+    raw = _lotteon_deescape(html or '')
+    if not raw:
+        return [], [], '원문 없음'
+
+    evidence = []
+    found = []
+
+    def add_size(v, why, snippet=''):
+        try:
+            n = int(float(str(v).strip()))
+        except Exception:
+            return
+        if not _lotteon_valid_kr_shoe_size(n):
+            return
+        s = str(n)
+        if s not in found:
+            found.append(s)
+        if len(evidence) < 80:
+            evidence.append({'사이즈':s, '근거':why, '원문일부':re.sub(r'\s+',' ',snippet)[:240]})
+
+    # 1) JSON/JS key-value: key에 size/사이즈/option이 명시된 경우
+    key_patterns = [
+        r'(?:shoe)?size(?:name|nm|value|val|text|option)?',
+        r'(?:opt|option)(?:name|nm|value|val|text)?',
+        r'(?:item|sku)(?:size|option)',
+        r'(?:size|사이즈)',
+    ]
+    key_union = '|'.join(key_patterns)
+    kv_pat = re.compile(
+        r'(?is)(?:["\']?(' + key_union + r')["\']?)\s*:\s*'
+        r'(?:(?:["\'])([^"\']{1,120})(?:["\'])|([0-9]{2,4}))'
+    )
+    for m in kv_pat.finditer(raw):
+        val = m.group(3) if m.group(3) is not None else m.group(2)
+        for x in re.findall(r'(?<!\d)(2\d{2}|3[0-5]\d)(?!\d)', str(val or '')):
+            add_size(x, f'키:{m.group(1)}', m.group(0))
+
+    # 2) "신발사이즈/사이즈" 주변 180자 안 숫자
+    context_pat = re.compile(r'(?is)(신발\s*사이즈|사이즈|shoe\s*size|size)')
+    for m in context_pat.finditer(raw):
+        a = max(0, m.start()-80)
+        b = min(len(raw), m.end()+220)
+        chunk = raw[a:b]
+        for x in re.findall(r'(?<!\d)(2\d{2}|3[0-5]\d)(?!\d)', chunk):
+            add_size(x, '사이즈 문맥', chunk)
+
+    # 3) 모델 주변 옵션 데이터
+    model = _norm_model_key(model)
+    if model:
+        up = raw.upper()
+        for mm in re.finditer(re.escape(model), up):
+            a = max(0, mm.start()-2500)
+            b = min(len(raw), mm.end()+8000)
+            chunk = raw[a:b]
+            if re.search(r'(?i)(size|사이즈|option|옵션)', chunk):
+                for x in re.findall(r'(?<!\d)(2\d{2}|3[0-5]\d)(?!\d)', chunk):
+                    # 너무 넓은 모델 문맥은 오탐 가능성이 있어 option/size 근접 숫자만
+                    pos = chunk.find(x)
+                    near = chunk[max(0,pos-120):pos+120]
+                    if re.search(r'(?i)(size|사이즈|option|옵션)', near):
+                        add_size(x, '품번 주변 옵션문맥', near)
+
+    found = sorted(set(found), key=lambda z:int(z))
+    # 신발에서 지나치게 넓은 비연속 집합은 자동확정하지 않고 후보만 제공.
+    return found, evidence, f'{len(found)}개 사이즈 후보'
+
+
+def fetch_lotteon_product_sizes(product_url, model=''):
+    """
+    상품 상세 URL에서 사이즈 후보를 읽는다.
+    실패하면 같은 품번 롯데ON 검색 페이지 원문도 보조 확인한다.
+    절대 자동 확정하지 않고 후보만 반환한다.
+    """
+    product_url = str(product_url or '').strip()
+    statuses = []
+    all_sizes = []
+    all_evidence = []
+
+    if product_url:
+        html, status = _lotteon_http_get(product_url)
+        statuses.append('상품페이지 '+status)
+        if html:
+            sizes, ev, _ = _lotteon_extract_sizes_from_product_html(html, model)
+            all_sizes.extend(sizes)
+            all_evidence.extend(ev)
+
+    # 상품 URL이 검색페이지 fallback이거나 상세페이지에서 못 찾으면 품번 검색 원문 보조
+    if not all_sizes and model:
+        qurl = 'https://www.lotteon.com/csearch/search/search?' + urllib.parse.urlencode({
+            'render':'search','platform':'pc','q':str(model).strip(),'mallId':'2'
+        })
+        html2, status2 = _lotteon_http_get(qurl)
+        statuses.append('품번검색 '+status2)
+        if html2:
+            sizes2, ev2, _ = _lotteon_extract_sizes_from_product_html(html2, model)
+            all_sizes.extend(sizes2)
+            all_evidence.extend(ev2)
+
+    all_sizes = sorted(set(all_sizes), key=lambda z:int(z))
+    # evidence dedupe
+    seen = set()
+    ev_out = []
+    for e in all_evidence:
+        k = (e.get('사이즈',''), e.get('근거',''), e.get('원문일부',''))
+        if k not in seen:
+            seen.add(k); ev_out.append(e)
+    return all_sizes, ev_out[:50], ' / '.join(statuses)
+
 def _lotteon_diag_snippets(html, brand, model_query=''):
     blob=_lotteon_deescape(html or '')
     models=[]
@@ -3001,8 +3145,8 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V20.10')
-st.caption('Build: V20.10 · 국내 실제 조달사이즈 확인 필수 + 확인된 사이즈만 실전추천 + POIZON/KREAM/쿠팡 판매처 비교')
+st.title('KREAM · POIZON · COUPANG 소싱 V20.11')
+st.caption('Build: V20.11 · 롯데ON 상품페이지 사이즈 자동후보 추출 + 사용자 확인저장 + 국내조달 실전추천')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -3298,7 +3442,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V20.5')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V20.11')
     st.caption('아디다스·나이키 후보를 수집한 뒤 품번별 POIZON 공식 API를 일괄 조회해 1차 소싱 후보를 자동 판정합니다. KREAM·쿠팡은 다음 단계에서 BEST 판매처 교차비교로 확장합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -3430,7 +3574,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
 
-        st.markdown('#### 🚀 V20.10 롯데 후보 → POIZON 이론판정 + 국내조달 실전판정')
+        st.markdown('#### 🚀 V20.11 롯데 후보 → POIZON 이론판정 + 국내조달 실전판정')
         st.caption('롯데에서 잡힌 품번을 POIZON 공식 API로 조회하되, 이론상 고마진 사이즈와 국내에서 실제 구매 가능한 사이즈를 분리합니다.')
         bc1,bc2=st.columns([1,3])
         _batch_n=bc1.number_input(
@@ -3489,7 +3633,7 @@ with tl:
                 st.warning('국내 실제 조달 확인까지 완료된 매입후보가 아직 없습니다.')
 
             # ===== V20.10 국내 실제 조달사이즈 확인 =====
-            st.markdown('#### 🏬 V20.10 국내 실제 조달사이즈 확인')
+            st.markdown('#### 🏬 V20.11 국내 실제 조달사이즈 확인')
             st.caption(
                 '여기가 실전 필터입니다. 롯데/아울렛/국내 온라인몰에서 실제로 살 수 있는 사이즈만 입력하세요. '
                 'POIZON에서 320 가격이 높아도 국내에서 못 사면 매입추천에 사용하지 않습니다.'
@@ -3504,6 +3648,49 @@ with tl:
             _existing_url = '' if _existing is None else str(_existing.get('source_url',''))
             _existing_memo = '' if _existing is None else str(_existing.get('memo',''))
 
+            # V20.11: 현재 롯데 후보표의 상품 상세 URL을 자동 연결
+            _src_hit = view[view['품번'].astype(str).map(_norm_model_key).eq(_norm_model_key(_vm))].copy() if isinstance(view,pd.DataFrame) and len(view) else pd.DataFrame()
+            _lotte_product_url = ''
+            if len(_src_hit):
+                _lotte_product_url = str(_src_hit.iloc[0].get('링크','') or '').strip()
+
+            st.markdown('##### 🤖 롯데ON 사이즈 자동후보 추출')
+            st.caption(
+                '상품 상세 원문에서 사이즈 후보를 읽습니다. 롯데ON이 JavaScript로 옵션을 늦게 불러오면 0개가 나올 수 있습니다. '
+                '자동추출 결과는 바로 확정하지 않고 반드시 실제 상품 옵션과 대조한 뒤 저장합니다.'
+            )
+            _auto_btn_col, _auto_url_col = st.columns([1,3])
+            with _auto_url_col:
+                st.text_input(
+                    '자동확인 대상 롯데 상품 URL',
+                    value=_lotte_product_url,
+                    key='v2011_auto_target_url',
+                    disabled=True
+                )
+            if _auto_btn_col.button('🤖 사이즈 자동확인', type='primary', width='stretch', key='v2011_auto_sizes'):
+                with st.spinner(f'{_vm} 롯데ON 상품페이지에서 사이즈 옵션을 확인 중...'):
+                    _asz, _aev, _ast = fetch_lotteon_product_sizes(_lotte_product_url, _vm)
+                st.session_state['v2011_auto_sizes_value'] = ','.join(_asz)
+                st.session_state['v2011_auto_sizes_evidence'] = _aev
+                st.session_state['v2011_auto_sizes_status'] = _ast
+                st.session_state['v2011_auto_sizes_model'] = _vm
+
+            if st.session_state.get('v2011_auto_sizes_model') == _vm:
+                _auto_status = st.session_state.get('v2011_auto_sizes_status','')
+                _auto_sizes = st.session_state.get('v2011_auto_sizes_value','')
+                if _auto_status:
+                    st.info('자동확인 상태: '+str(_auto_status))
+                if _auto_sizes:
+                    st.success('자동추출 사이즈 후보: '+str(_auto_sizes))
+                    st.caption('아래 입력칸에는 자동후보를 미리 넣었습니다. 실제 롯데 옵션을 보고 틀린 사이즈가 있으면 지우고 저장하세요.')
+                else:
+                    st.warning('자동으로 사이즈를 찾지 못했습니다. 롯데 상품이 옵션을 JavaScript로 불러오는 경우 수동 확인이 필요합니다.')
+
+                _aev = st.session_state.get('v2011_auto_sizes_evidence',[]) or []
+                if _aev:
+                    with st.expander('🔎 자동추출 근거 보기'):
+                        st.dataframe(pd.DataFrame(_aev), width='stretch', hide_index=True)
+
             # POIZON 실제 판매 사이즈/판매량을 참고로 보여줌
             _pp = load_platform_cache(POIZON_CACHE_PATH)
             if isinstance(_pp, pd.DataFrame) and len(_pp):
@@ -3515,26 +3702,32 @@ with tl:
 
             dc1,dc2 = st.columns([2,1])
             with dc1:
+                _auto_default = ''
+                if st.session_state.get('v2011_auto_sizes_model') == _vm:
+                    _auto_default = str(st.session_state.get('v2011_auto_sizes_value','') or '')
+                _dom_default = _existing_sizes or _auto_default
+
+                # 모델을 바꾸면 위젯 key도 바꿔 다른 품번의 값이 섞이지 않게 한다.
                 _dom_sizes = st.text_input(
                     '국내에서 지금 실제 구매 가능한 KR 사이즈',
-                    value=_existing_sizes,
+                    value=_dom_default,
                     placeholder='예: 250,255,260,265,270,275,280',
-                    key='v2010_domestic_sizes'
+                    key=f'v2011_domestic_sizes_{_norm_model_key(_vm)}'
                 )
                 _dom_url = st.text_input(
                     '확인한 국내 상품 URL (선택)',
-                    value=_existing_url,
-                    key='v2010_domestic_url'
+                    value=_existing_url or _lotte_product_url,
+                    key=f'v2011_domestic_url_{_norm_model_key(_vm)}'
                 )
             with dc2:
                 _dom_memo = st.text_area(
                     '메모 (선택)',
                     value=_existing_memo,
                     placeholder='예: 롯데ON 옵션에서 직접 확인 / 매장 재고 확인',
-                    key='v2010_domestic_memo'
+                    key=f'v2011_domestic_memo_{_norm_model_key(_vm)}'
                 )
 
-            if st.button('✅ 국내 조달 가능 사이즈 저장', type='primary', width='stretch', key='v2010_domestic_save'):
+            if st.button('✅ 국내 조달 가능 사이즈 저장', type='primary', width='stretch', key='v2011_domestic_save'):
                 _ok, _msg = save_domestic_size_check(_vm, _dom_sizes, _dom_url, _dom_memo)
                 if _ok:
                     st.success(_msg)
@@ -3553,7 +3746,7 @@ with tl:
                     f"⚠️ {_vm} 국내 조달 사이즈 미확인 · 이론상 BEST가 있어도 오늘 살 것에는 올리지 않습니다."
                 )
 
-            st.markdown('#### 🔁 V20.10 POIZON 실전후보 → KREAM 보조 교차검증')
+            st.markdown('#### 🔁 V20.11 POIZON 실전후보 → KREAM 보조 교차검증')
             st.caption(
                 'POIZON 1차판정에서 살아남은 상품만 KREAM에서 정확 품번으로 자동 매칭합니다. '
                 '같은 KR 사이즈끼리 즉시판매가·최근체결가·30일 판매량을 비교해 최종 BEST 판매처를 고릅니다.'
@@ -3670,7 +3863,7 @@ with tl:
                     st.caption(str(_m))
 
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 상세 확인 · V20.10')
+        st.markdown('#### 🧪 1개 상품 상세 확인 · V20.11')
         st.caption('후보 1개를 골라 POIZON 공식 API로 상세검증하고, 아래 KREAM 자동 교차검증으로 동일 품번·동일 KR사이즈를 다시 확인합니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
@@ -4614,7 +4807,7 @@ with t5:
 ''')
 
 with t6:
-    st.subheader('🛒 오늘 살 것 V20.10')
+    st.subheader('🛒 오늘 살 것 V20.11')
     st.caption(
         '저장 후보 + 현재 롯데 자동소싱 결과를 한곳에 모아 '
         '수익성·ROI·30일 판매량·판정등급을 함께 보고 예산 안에서 오늘 살 상품을 자동선정합니다. '
@@ -5146,7 +5339,7 @@ with t6:
 
 # ===== V20.9 COUPANG SELL-MARKET COMPETITION CHECK =====
 with t7:
-    st.subheader('🟦 쿠팡 판매처 비교 V20.10')
+    st.subheader('🟦 쿠팡 판매처 비교 V20.11')
     st.caption(
         '쿠팡은 소싱처가 아니라 POIZON·KREAM과 같은 판매처입니다. '
         '국내에서 매입한 상품을 쿠팡에 팔 때의 경쟁가격·동일사이즈 경쟁여부·수수료를 확인해 '
