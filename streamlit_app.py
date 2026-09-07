@@ -48,7 +48,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.9.1', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.10', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -97,6 +97,71 @@ DISCOVERY_PATH = DATA_DIR / 'poizon_discovery.csv'
 LOTTEON_PATH = DATA_DIR / 'lotteon_sourcing.csv'
 
 COUPANG_MANUAL_PATH = DATA_DIR / 'coupang_manual_checks.csv'
+
+DOMESTIC_SIZE_PATH = DATA_DIR / 'domestic_size_checks.csv'
+
+def load_domestic_size_checks():
+    cols = ['model','available_sizes','source_url','memo','checked_at']
+    if DOMESTIC_SIZE_PATH.exists():
+        try:
+            d = pd.read_csv(DOMESTIC_SIZE_PATH, dtype=str)
+            for c in cols:
+                if c not in d.columns:
+                    d[c] = ''
+            return d[cols]
+        except Exception:
+            pass
+    return pd.DataFrame(columns=cols)
+
+def _parse_size_list(v):
+    vals = []
+    for x in re.findall(r'\d+(?:\.0+)?', str(v or '')):
+        k = _norm_kr_size_key(x)
+        if k and k not in vals:
+            vals.append(k)
+    return vals
+
+def get_domestic_confirmed_sizes(model):
+    model = _norm_model_key(model)
+    d = load_domestic_size_checks()
+    if not model or not len(d):
+        return []
+    hit = d[d['model'].astype(str).map(_norm_model_key).eq(model)]
+    if not len(hit):
+        return []
+    return _parse_size_list(hit.iloc[-1].get('available_sizes',''))
+
+def get_domestic_size_check_row(model):
+    model = _norm_model_key(model)
+    d = load_domestic_size_checks()
+    if not model or not len(d):
+        return None
+    hit = d[d['model'].astype(str).map(_norm_model_key).eq(model)]
+    if not len(hit):
+        return None
+    return hit.iloc[-1]
+
+def save_domestic_size_check(model, available_sizes, source_url='', memo=''):
+    model = _norm_model_key(model)
+    sizes = _parse_size_list(available_sizes)
+    if not model:
+        return False, '품번이 없습니다.'
+    if not sizes:
+        return False, '국내에서 실제 구매 가능한 사이즈를 1개 이상 입력하세요.'
+    d = load_domestic_size_checks().copy()
+    if len(d):
+        d = d[~d['model'].astype(str).map(_norm_model_key).eq(model)].copy()
+    row = {
+        'model': model,
+        'available_sizes': ','.join(sizes),
+        'source_url': str(source_url or '').strip(),
+        'memo': str(memo or '').strip(),
+        'checked_at': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    d = pd.concat([d, pd.DataFrame([row])], ignore_index=True)
+    d.to_csv(DOMESTIC_SIZE_PATH, index=False, encoding='utf-8-sig')
+    return True, f'{model} 국내 조달 가능 사이즈 저장: {", ".join(sizes)}'
+
 
 def load_coupang_manual():
     cols = [
@@ -993,39 +1058,29 @@ def compute_compare(base, kream=None, poizon=None):
     return df
 
 
-# ==================== V20.9 PRACTICAL SIZE PRIORITY ====================
-def _v209_size_penalty(size_value):
-    """
-    실전 조달 난이도 보정.
-    특정 성별/모델의 '인기 사이즈'를 임의로 단정하지 않고,
-    극단적으로 큰/작은 KR 사이즈만 보수적으로 감점한다.
-    실제 판매량 데이터가 크면 감점을 상쇄할 수 있다.
-    """
+# ==================== V20.10 DOMESTIC-AVAILABLE SIZE PRIORITY ====================
+def _v2010_size_penalty(size_value):
+    # 숫자 자체로 탈락시키지 않는다. 실제 국내 조달 확인이 1순위다.
     s = _norm_kr_size_key(size_value)
     try:
         n = int(float(s))
     except Exception:
-        return 8.0, '사이즈형식 확인'
-
+        return 5.0, '사이즈형식 확인'
     if n >= 315:
-        return 22.0, '대형 특수사이즈'
+        return 8.0, '대형/희귀 가능성'
     if n >= 305:
-        return 15.0, '대형 사이즈'
-    if n >= 295:
-        return 8.0, '큰 사이즈'
+        return 5.0, '큰 사이즈'
     if n <= 215:
-        return 12.0, '소형 특수사이즈'
-    if n <= 225:
-        return 6.0, '작은 사이즈'
+        return 6.0, '소형/희귀 가능성'
     return 0.0, '일반 범위'
 
 
-def v20_9_choose_practical_size(model, buy_price):
+def v20_10_choose_practical_size(model, buy_price, include_kream=True):
     """
-    같은 품번의 전체 사이즈를 다시 비교해
-    ① 최고 예상순익 사이즈와
-    ② 판매량/수익/ROI/사이즈 난이도를 함께 본 실전추천 사이즈
-    를 따로 반환한다.
+    V20.10 핵심:
+    1) 전체 플랫폼 데이터에서 '이론상 최고수익 사이즈'는 참고로 계산.
+    2) 실전추천은 국내에서 실제 구매 가능하다고 확인·저장한 사이즈만 후보로 사용.
+    3) 국내 확인값이 없으면 오늘 살 것/매입추천으로 올리지 않는다.
     """
     model = _norm_model_key(model)
     buy = won_to_num(buy_price)
@@ -1038,7 +1093,7 @@ def v20_9_choose_practical_size(model, buy_price):
     }])
 
     p = load_platform_cache(POIZON_CACHE_PATH)
-    k = load_platform_cache(KREAM_CACHE_PATH)
+    k = load_platform_cache(KREAM_CACHE_PATH) if include_kream else pd.DataFrame()
 
     if isinstance(p, pd.DataFrame) and len(p):
         p = p[p['model'].astype(str).map(_norm_model_key).eq(model)].copy()
@@ -1064,19 +1119,62 @@ def v20_9_choose_practical_size(model, buy_price):
     d['_profit'] = pd.to_numeric(d.get('best_profit'), errors='coerce')
     d['_roi'] = pd.to_numeric(d.get('best_roi'), errors='coerce')
     d['_sales'] = pd.to_numeric(d.get('best_30d_sales'), errors='coerce').fillna(0)
-
-    # 비교 가능한 이익이 있는 사이즈만 후보.
     d = d[d['_profit'].notna() & (d['_profit'] > 0)].copy()
     if not len(d):
         return None
 
-    # 최고수익 사이즈는 순익 그대로.
+    # 이론상 최고수익은 참고용.
     profit_best = d.sort_values(
         ['_profit','_sales','_roi'], ascending=[False,False,False]
     ).iloc[0]
 
-    # 실전점수:
-    # 판매 회전 40 + 순익 25 + ROI 20 + 기존 판정 15 - 특수사이즈 감점
+    confirmed = get_domestic_confirmed_sizes(model)
+    base_result = {
+        '최고수익사이즈': str(profit_best.get('size','')),
+        '최고수익판매처': str(profit_best.get('best_platform','')),
+        '최고수익순익': profit_best.get('best_profit'),
+        '최고수익ROI': profit_best.get('best_roi'),
+        '최고수익30일판매': profit_best.get('best_30d_sales'),
+        '국내조달확인사이즈': ','.join(confirmed),
+        '국내조달확인': bool(confirmed),
+    }
+
+    if not confirmed:
+        base_result.update({
+            '실전추천사이즈':'',
+            '실전추천판매처':'',
+            '실전추천순익':None,
+            '실전추천ROI':None,
+            '실전추천30일판매':None,
+            '실전사이즈점수':None,
+            '사이즈난이도':'국내 조달 미확인',
+            '실전판정':'🟡 조달확인필요',
+            '실전판정이유':'국내에서 실제 구매 가능한 사이즈가 아직 확인되지 않음',
+            '실전추천수량':0,
+            '실전권장최대매입가':None,
+        })
+        return base_result
+
+    # 실전 후보 = 국내 실제 구매 가능 확인 사이즈와 정확히 일치하는 행만.
+    d['_size_key'] = d.get('size', '').map(_norm_kr_size_key)
+    practical_pool = d[d['_size_key'].isin(set(confirmed))].copy()
+
+    if not len(practical_pool):
+        base_result.update({
+            '실전추천사이즈':'',
+            '실전추천판매처':'',
+            '실전추천순익':None,
+            '실전추천ROI':None,
+            '실전추천30일판매':None,
+            '실전사이즈점수':None,
+            '사이즈난이도':'조달확인 사이즈와 판매데이터 불일치',
+            '실전판정':'🔴 PASS',
+            '실전판정이유':'국내 조달 확인 사이즈 중 POIZON/KREAM에서 유효한 판매가격·수익 데이터가 없음',
+            '실전추천수량':0,
+            '실전권장최대매입가':None,
+        })
+        return base_result
+
     grade_pts = {
         '🟢🟢 강력매입': 15.0,
         '🟢 매입추천': 13.0,
@@ -1085,37 +1183,31 @@ def v20_9_choose_practical_size(model, buy_price):
         '🔴 PASS': 0.0,
         '⚪ 데이터부족': 0.0,
     }
-    d['_grade_score'] = d.get('판정', '').map(grade_pts).fillna(0.0)
-    d['_profit_score'] = (d['_profit'].clip(lower=0) / 30000.0 * 25.0).clip(upper=25.0)
-    d['_roi_score'] = (d['_roi'].clip(lower=0) / 40.0 * 20.0).clip(upper=20.0)
-    d['_sales_score'] = (d['_sales'].clip(lower=0) / 10.0 * 40.0).clip(upper=40.0)
+    practical_pool['_grade_score'] = practical_pool.get('판정','').map(grade_pts).fillna(0.0)
+    practical_pool['_profit_score'] = (practical_pool['_profit'].clip(lower=0) / 30000.0 * 25.0).clip(upper=25.0)
+    practical_pool['_roi_score'] = (practical_pool['_roi'].clip(lower=0) / 40.0 * 20.0).clip(upper=20.0)
+    practical_pool['_sales_score'] = (practical_pool['_sales'].clip(lower=0) / 10.0 * 40.0).clip(upper=40.0)
 
     penalties, labels = [], []
-    for x in d.get('size', pd.Series([''] * len(d), index=d.index)):
-        pen, lab = _v209_size_penalty(x)
-        penalties.append(pen)
-        labels.append(lab)
-    d['_size_penalty'] = penalties
-    d['_size_label'] = labels
-
-    # 판매량이 실제로 강하면 희귀사이즈도 살아남을 수 있게 "감점"만 한다.
-    d['실전사이즈점수'] = (
-        d['_grade_score'] + d['_profit_score'] + d['_roi_score'] +
-        d['_sales_score'] - d['_size_penalty']
+    for x in practical_pool.get('size', pd.Series([''] * len(practical_pool), index=practical_pool.index)):
+        pen, lab = _v2010_size_penalty(x)
+        penalties.append(pen); labels.append(lab)
+    practical_pool['_size_penalty'] = penalties
+    practical_pool['_size_label'] = labels
+    practical_pool['실전사이즈점수'] = (
+        practical_pool['_grade_score'] +
+        practical_pool['_profit_score'] +
+        practical_pool['_roi_score'] +
+        practical_pool['_sales_score'] -
+        practical_pool['_size_penalty']
     ).round(1)
 
-    practical = d.sort_values(
+    practical = practical_pool.sort_values(
         ['실전사이즈점수','_sales','_profit','_roi'],
         ascending=[False,False,False,False]
     ).iloc[0]
 
-    return {
-        '최고수익사이즈': str(profit_best.get('size','')),
-        '최고수익판매처': str(profit_best.get('best_platform','')),
-        '최고수익순익': profit_best.get('best_profit'),
-        '최고수익ROI': profit_best.get('best_roi'),
-        '최고수익30일판매': profit_best.get('best_30d_sales'),
-
+    base_result.update({
         '실전추천사이즈': str(practical.get('size','')),
         '실전추천판매처': str(practical.get('best_platform','')),
         '실전추천순익': practical.get('best_profit'),
@@ -1127,8 +1219,65 @@ def v20_9_choose_practical_size(model, buy_price):
         '실전판정이유': practical.get('판정이유',''),
         '실전추천수량': practical.get('추천구매수량',0),
         '실전권장최대매입가': practical.get('권장최대매입가'),
-    }
-# ==================== END V20.9 PRACTICAL SIZE PRIORITY ====================
+    })
+    return base_result
+
+
+def v20_10_apply_domestic_gate_to_batch(batch_df):
+    """롯데→POIZON 1차판정표를 '실제 국내 조달 가능 사이즈' 기준으로 실전화."""
+    if not isinstance(batch_df, pd.DataFrame) or not len(batch_df):
+        return batch_df
+    out = batch_df.copy()
+    for c in ['국내조달확인사이즈','이론최고사이즈','실전추천사이즈','실전상태']:
+        if c not in out.columns:
+            out[c] = ''
+    for idx, r in out.iterrows():
+        info = v20_10_choose_practical_size(
+            r.get('품번',''), r.get('롯데매입가',0), include_kream=False
+        )
+        if not info:
+            out.loc[idx,'실전상태'] = '⚪ 데이터부족'
+            continue
+
+        out.loc[idx,'이론최고사이즈'] = info.get('최고수익사이즈','')
+        out.loc[idx,'국내조달확인사이즈'] = info.get('국내조달확인사이즈','')
+        out.loc[idx,'실전추천사이즈'] = info.get('실전추천사이즈','')
+
+        if not info.get('국내조달확인'):
+            out.loc[idx,'최종판정'] = '🟡 조달확인필요'
+            out.loc[idx,'추천수량'] = 0
+            out.loc[idx,'실전상태'] = '국내 실제 구매가능 사이즈 미확인'
+            out.loc[idx,'이유'] = (
+                f"이론 최고 KR {info.get('최고수익사이즈','')}는 참고만. "
+                "국내 실제 구매 가능한 사이즈를 확인해야 매입판정 가능"
+            )
+            continue
+
+        if not info.get('실전추천사이즈'):
+            out.loc[idx,'최종판정'] = '🔴 PASS'
+            out.loc[idx,'추천수량'] = 0
+            out.loc[idx,'실전상태'] = info.get('실전판정이유','실전추천 없음')
+            out.loc[idx,'이유'] = info.get('실전판정이유','실전추천 없음')
+            continue
+
+        # 실전 추천값으로 1차 판정표를 교체.
+        out.loc[idx,'BEST사이즈'] = info.get('실전추천사이즈')
+        out.loc[idx,'최종판정'] = info.get('실전판정', out.loc[idx,'최종판정'])
+        out.loc[idx,'예상순이익'] = info.get('실전추천순익')
+        out.loc[idx,'ROI(%)'] = info.get('실전추천ROI')
+        out.loc[idx,'30일판매'] = info.get('실전추천30일판매')
+        out.loc[idx,'추천수량'] = int(info.get('실전추천수량') or 0)
+        out.loc[idx,'권장최대매입가'] = info.get('실전권장최대매입가')
+        out.loc[idx,'실전상태'] = (
+            f"국내조달 확인 KR {info.get('실전추천사이즈')} · "
+            f"{info.get('사이즈난이도','')}"
+        )
+        out.loc[idx,'이유'] = (
+            f"국내조달 확인 사이즈 중 실전추천 KR {info.get('실전추천사이즈')} · "
+            f"{info.get('실전판정이유','')}"
+        )
+    return out
+# ==================== END V20.10 DOMESTIC-AVAILABLE SIZE PRIORITY ====================
 
 
 def load_discovery_db():
@@ -2852,8 +3001,8 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V20.9.1')
-st.caption('Build: V20.9 · 실전추천 사이즈 + 희귀사이즈 감점 + 오늘 살 것 실전우선 + 쿠팡 판매처 비교')
+st.title('KREAM · POIZON · COUPANG 소싱 V20.10')
+st.caption('Build: V20.10 · 국내 실제 조달사이즈 확인 필수 + 확인된 사이즈만 실전추천 + POIZON/KREAM/쿠팡 판매처 비교')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -3281,8 +3430,8 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
 
-        st.markdown('#### 🚀 V20.5 롯데 후보 → POIZON 1차판정')
-        st.caption('롯데에서 잡힌 아디다스·나이키 품번을 POIZON 공식 API로 순차 조회해 실제 판매량이 있는 가격만으로 소싱 가능성을 판정합니다.')
+        st.markdown('#### 🚀 V20.10 롯데 후보 → POIZON 이론판정 + 국내조달 실전판정')
+        st.caption('롯데에서 잡힌 품번을 POIZON 공식 API로 조회하되, 이론상 고마진 사이즈와 국내에서 실제 구매 가능한 사이즈를 분리합니다.')
         bc1,bc2=st.columns([1,3])
         _batch_n=bc1.number_input(
             '이번에 검사할 상품 수', min_value=1, max_value=30, value=5, step=1,
@@ -3312,6 +3461,9 @@ with tl:
 
         _bout=st.session_state.get('v191_lotte_batch_result',pd.DataFrame())
         if isinstance(_bout,pd.DataFrame) and len(_bout):
+            # V20.10: 이론상 최고마진 사이즈가 아니라 국내 실제 구매가능 확인 사이즈로 재판정
+            _bout = v20_10_apply_domestic_gate_to_batch(_bout)
+            st.session_state['v2010_lotte_practical_result'] = _bout
             _buyable=_bout[_bout['최종판정'].isin(['🟢🟢 강력매입','🟢 매입추천','🟠 1개 테스트'])]
             st.markdown(f'##### 📊 POIZON 1차판정 결과 · 전체 {len(_bout)}개 / 매입후보 {len(_buyable)}개')
             st.dataframe(
@@ -3329,14 +3481,79 @@ with tl:
             if len(_buyable):
                 _top=_buyable.iloc[0]
                 st.success(
-                    f"🏆 현재 1순위: {_top['브랜드']} {_top['품번']} / KR {_top['BEST사이즈']} / "
+                    f"🏆 실전 1순위: {_top['브랜드']} {_top['품번']} / KR {_top['BEST사이즈']} / "
                     f"{_top['최종판정']} / 예상순익 {float(_top['예상순이익']):,.0f}원 / "
                     f"ROI {float(_top['ROI(%)']):.1f}% / 30일 {int(float(_top['30일판매'])) if pd.notna(_top['30일판매']) else 0}건"
                 )
             else:
-                st.warning('이번 검사 상품에서는 POIZON 기준 매입후보가 없습니다.')
+                st.warning('국내 실제 조달 확인까지 완료된 매입후보가 아직 없습니다.')
 
-            st.markdown('#### 🔁 V20.5 POIZON 매입후보 → KREAM 보조 교차검증')
+            # ===== V20.10 국내 실제 조달사이즈 확인 =====
+            st.markdown('#### 🏬 V20.10 국내 실제 조달사이즈 확인')
+            st.caption(
+                '여기가 실전 필터입니다. 롯데/아울렛/국내 온라인몰에서 실제로 살 수 있는 사이즈만 입력하세요. '
+                'POIZON에서 320 가격이 높아도 국내에서 못 사면 매입추천에 사용하지 않습니다.'
+            )
+            _verify_models = _bout['품번'].astype(str).tolist()
+            _vm = st.selectbox(
+                '조달 확인할 품번', _verify_models,
+                key='v2010_domestic_model'
+            )
+            _existing = get_domestic_size_check_row(_vm)
+            _existing_sizes = '' if _existing is None else str(_existing.get('available_sizes',''))
+            _existing_url = '' if _existing is None else str(_existing.get('source_url',''))
+            _existing_memo = '' if _existing is None else str(_existing.get('memo',''))
+
+            # POIZON 실제 판매 사이즈/판매량을 참고로 보여줌
+            _pp = load_platform_cache(POIZON_CACHE_PATH)
+            if isinstance(_pp, pd.DataFrame) and len(_pp):
+                _pp = _pp[_pp['model'].astype(str).map(_norm_model_key).eq(_norm_model_key(_vm))].copy()
+                if len(_pp):
+                    _cols = [c for c in ['size','eu_size','poizon_global_min_price','poizon_30d_sales'] if c in _pp.columns]
+                    if _cols:
+                        st.dataframe(_pp[_cols], width='stretch', hide_index=True)
+
+            dc1,dc2 = st.columns([2,1])
+            with dc1:
+                _dom_sizes = st.text_input(
+                    '국내에서 지금 실제 구매 가능한 KR 사이즈',
+                    value=_existing_sizes,
+                    placeholder='예: 250,255,260,265,270,275,280',
+                    key='v2010_domestic_sizes'
+                )
+                _dom_url = st.text_input(
+                    '확인한 국내 상품 URL (선택)',
+                    value=_existing_url,
+                    key='v2010_domestic_url'
+                )
+            with dc2:
+                _dom_memo = st.text_area(
+                    '메모 (선택)',
+                    value=_existing_memo,
+                    placeholder='예: 롯데ON 옵션에서 직접 확인 / 매장 재고 확인',
+                    key='v2010_domestic_memo'
+                )
+
+            if st.button('✅ 국내 조달 가능 사이즈 저장', type='primary', width='stretch', key='v2010_domestic_save'):
+                _ok, _msg = save_domestic_size_check(_vm, _dom_sizes, _dom_url, _dom_memo)
+                if _ok:
+                    st.success(_msg)
+                    st.rerun()
+                else:
+                    st.error(_msg)
+
+            _confirmed_now = get_domestic_confirmed_sizes(_vm)
+            if _confirmed_now:
+                st.success(
+                    f"✅ {_vm} 국내 조달 확인 사이즈: {', '.join(_confirmed_now)} · "
+                    "이 사이즈들 안에서만 POIZON/KREAM 실전추천을 계산합니다."
+                )
+            else:
+                st.warning(
+                    f"⚠️ {_vm} 국내 조달 사이즈 미확인 · 이론상 BEST가 있어도 오늘 살 것에는 올리지 않습니다."
+                )
+
+            st.markdown('#### 🔁 V20.10 POIZON 실전후보 → KREAM 보조 교차검증')
             st.caption(
                 'POIZON 1차판정에서 살아남은 상품만 KREAM에서 정확 품번으로 자동 매칭합니다. '
                 '같은 KR 사이즈끼리 즉시판매가·최근체결가·30일 판매량을 비교해 최종 BEST 판매처를 고릅니다.'
@@ -3431,7 +3648,7 @@ with tl:
                     _z = _xaction.iloc[0]
                     _sales_txt = int(float(_z['30일판매'])) if pd.notna(_z.get('30일판매')) else 0
                     st.success(
-                        f"🏆 최종 1순위: {_z['브랜드']} {_z['품번']} / KR {_z['BEST사이즈']} / "
+                        f"🏆 최종 실전 1순위: {_z['브랜드']} {_z['품번']} / KR {_z['BEST사이즈']} / "
                         f"{_z['최종판정']} / 판매처 {_z['추천판매처']} / "
                         f"예상순익 {float(_z['예상순이익']):,.0f}원 / "
                         f"ROI {float(_z['ROI(%)']):.1f}% / 30일 {_sales_txt}건 / "
@@ -3453,7 +3670,7 @@ with tl:
                     st.caption(str(_m))
 
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 상세 확인 · V20.5')
+        st.markdown('#### 🧪 1개 상품 상세 확인 · V20.10')
         st.caption('후보 1개를 골라 POIZON 공식 API로 상세검증하고, 아래 KREAM 자동 교차검증으로 동일 품번·동일 KR사이즈를 다시 확인합니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
@@ -3616,7 +3833,7 @@ with tl:
                             _final=_cross_show[_cross_show['최종판정'].isin(['🟢🟢 강력매입','🟢 매입추천','🟠 1개 테스트'])]
                             if len(_final):
                                 _z=_final.iloc[0]
-                                st.success(f"🏆 최종 1순위: KR {_z['사이즈']} · {_z['최종판정']} · 판매처 {_z['추천 판매처']} · 예상 순익 {float(_z['예상 순이익']):,.0f}원 · ROI {float(_z['ROI(%)']):.1f}%")
+                                st.success(f"🏆 최종 실전 1순위: KR {_z['사이즈']} · {_z['최종판정']} · 판매처 {_z['추천 판매처']} · 예상 순익 {float(_z['예상 순이익']):,.0f}원 · ROI {float(_z['ROI(%)']):.1f}%")
                             else:
                                 st.warning('POIZON+KREAM 교차검증 기준에서도 현재 매입 추천 사이즈가 없습니다.')
                     st.caption('KREAM 자동조회가 막히면 ③ KREAM 가져오기 탭의 수동 입력을 백업으로 사용합니다.')
@@ -4390,21 +4607,21 @@ with t5:
 3. 국내 매입가까지 넣으면 V11이 **예상 순익·ROI·권장 최대 매입가**를 계산해 `🟠 1족 테스트` 여부를 판정합니다.  
 4. 실제로 살 후보만 **① 상품등록**에 옮기고, `② POIZON 가져오기`와 `③ KREAM 가져오기`에서 상세 사이즈 데이터를 붙여넣습니다.  
 5. `④ 자동 비교`에서 최종 판정을 확인하고, 처음에는 **잘 팔리는 사이즈 1족만 테스트 매입**합니다.  
-6. `⑥ 오늘 살 것`에서는 저장된 실전 후보를 예산 안에서 구매 우선순위로 정리합니다.
+6. `⑥ 오늘 살 것`에서는 국내 실제 조달 확인된 사이즈만 예산 안에서 구매 우선순위로 정리합니다.
 
 **V11의 목적은 '싸 보이는 물건을 먼저 사는 것'이 아니라, POIZON에서 실제로 팔리는 상품을 먼저 찾고 한국에서 싸게 소싱하는 것입니다.**  
 완전 자동 로그인/수집은 플랫폼의 공식 API 또는 허용된 연동 방식이 확인된 뒤 붙이는 것이 안전합니다.
 ''')
 
 with t6:
-    st.subheader('🛒 오늘 살 것 V20.9')
+    st.subheader('🛒 오늘 살 것 V20.10')
     st.caption(
         '저장 후보 + 현재 롯데 자동소싱 결과를 한곳에 모아 '
         '수익성·ROI·30일 판매량·판정등급을 함께 보고 예산 안에서 오늘 살 상품을 자동선정합니다. '
         '실제 결제 직전에는 판매가와 재고를 한 번 더 확인하세요.'
     )
     st.info(
-        'V20.9는 최고마진 사이즈와 실전추천 사이즈를 분리합니다. '
+        'V20.10은 최고마진과 실제 조달가능 사이즈를 분리합니다. '
         '320처럼 마진은 높아도 판매량/조달 난이도가 불리한 사이즈는 감점하고, '
         '오늘 살 것에는 회전·순익·ROI를 함께 본 실전추천 사이즈를 우선 반영합니다.'
     )
@@ -4493,7 +4710,7 @@ with t6:
                 '현재매입가':0, '권장최대매입가':None, '추천판매처':'',
                 '최고예상순익':0, '최고ROI(%)':-999, '추천처30일판매':0,
                 '추천구매수량':0, '매입가이드':'', '소싱처':'',
-                '교차검증상태':'', '상품URL':'', '저장일시':''
+                '교차검증상태':'', '상품URL':'', '저장일시':'', '국내조달확인사이즈':'', '실전추천사이즈':'', '조달상태':''
             }.items():
                 if c not in all_candidates.columns:
                     all_candidates[c] = default
@@ -4512,17 +4729,17 @@ with t6:
             all_candidates['추천구매수량'] = all_candidates['추천구매수량'].fillna(0).astype(int)
 
             # =========================================================
-            # V20.9 최고수익 사이즈와 실전추천 사이즈 분리
+            # V20.10 국내 실제 조달가능 사이즈만 실전추천
             # =========================================================
-            _v209_rows = []
+            _v2010_rows = []
             for _idx, _rr in all_candidates.iterrows():
-                _info = v20_9_choose_practical_size(
+                _info = v20_10_choose_practical_size(
                     _rr.get('모델',''), _rr.get('현재매입가',0)
                 )
                 if _info:
-                    _v209_rows.append((_idx, _info))
+                    _v2010_rows.append((_idx, _info))
 
-            for _idx, _info in _v209_rows:
+            for _idx, _info in _v2010_rows:
                 # 기존 BEST를 최고수익 참고값으로 보존
                 all_candidates.loc[_idx, '최고수익사이즈'] = _info.get('최고수익사이즈','')
                 all_candidates.loc[_idx, '최고수익순익'] = _info.get('최고수익순익')
@@ -4533,8 +4750,19 @@ with t6:
                 all_candidates.loc[_idx, '실전추천사이즈'] = _info.get('실전추천사이즈','')
                 all_candidates.loc[_idx, '실전사이즈점수'] = _info.get('실전사이즈점수')
                 all_candidates.loc[_idx, '사이즈난이도'] = _info.get('사이즈난이도','')
+                all_candidates.loc[_idx, '국내조달확인사이즈'] = _info.get('국내조달확인사이즈','')
+                all_candidates.loc[_idx, '조달상태'] = (
+                    '✅ 국내 조달확인' if _info.get('국내조달확인') else '🟡 국내 조달 미확인'
+                )
 
-                if _info.get('실전추천사이즈'):
+                if not _info.get('국내조달확인'):
+                    all_candidates.loc[_idx, '판정'] = '🟡 조달확인필요'
+                    all_candidates.loc[_idx, '추천구매수량'] = 0
+                    all_candidates.loc[_idx, '매입가이드'] = (
+                        f"이론 최고 KR {_info.get('최고수익사이즈','')} · "
+                        "국내 실제 구매가능 사이즈 확인 전 매입 금지"
+                    )
+                elif _info.get('실전추천사이즈'):
                     all_candidates.loc[_idx, 'KR사이즈'] = _info.get('실전추천사이즈')
                     all_candidates.loc[_idx, '추천판매처'] = _info.get('실전추천판매처','')
                     all_candidates.loc[_idx, '최고예상순익'] = _info.get('실전추천순익')
@@ -4918,7 +5146,7 @@ with t6:
 
 # ===== V20.9 COUPANG SELL-MARKET COMPETITION CHECK =====
 with t7:
-    st.subheader('🟦 쿠팡 판매처 비교 V20.9')
+    st.subheader('🟦 쿠팡 판매처 비교 V20.10')
     st.caption(
         '쿠팡은 소싱처가 아니라 POIZON·KREAM과 같은 판매처입니다. '
         '국내에서 매입한 상품을 쿠팡에 팔 때의 경쟁가격·동일사이즈 경쟁여부·수수료를 확인해 '
