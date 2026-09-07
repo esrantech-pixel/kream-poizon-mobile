@@ -48,7 +48,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.3', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.5', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -2674,6 +2674,148 @@ with st.sidebar:
     s['min_30d_sales']=st.number_input('추천 최소 30일 판매량',0,100000,int(s['min_30d_sales']),10)
     st.info('수수료는 실제 계정/카테고리에 따라 달라질 수 있습니다. 판매 확정 전 플랫폼 정산화면으로 최종 확인하세요.')
 
+
+# ===== V20.5 PAYMENT-BEFORE FINAL REVALIDATION =====
+def v20_5_final_revalidate(today_buy_df):
+    """롯데 현재가 + POIZON 공식 API + KREAM 가능 시 재조회 후 결제 직전 재판정."""
+    if today_buy_df is None or not isinstance(today_buy_df, pd.DataFrame) or today_buy_df.empty:
+        return pd.DataFrame(), []
+
+    rows, messages, lotte_cache = [], [], {}
+
+    for _, old in today_buy_df.iterrows():
+        model = str(old.get('모델','') or '').strip().upper()
+        brand = str(old.get('브랜드','') or '').strip()
+        name = str(old.get('상품명','') or '').strip()
+        old_buy = won_to_num(old.get('현재매입가'))
+        old_url = str(old.get('상품URL','') or '').strip()
+
+        if not brand:
+            nlow = name.lower()
+            brand = '나이키' if ('나이키' in name or 'nike' in nlow) else ('아디다스' if ('아디다스' in name or 'adidas' in nlow) else '')
+
+        current_buy, current_url = old_buy, old_url
+        lotte_status = '⚠️ 롯데 현재가 미확인'
+
+        try:
+            if brand:
+                if brand not in lotte_cache:
+                    ld, _, _ = fetch_lotteon_search(brand, max_items=200)
+                    lotte_cache[brand] = ld if isinstance(ld, pd.DataFrame) else pd.DataFrame()
+                ld = lotte_cache[brand]
+                if len(ld) and '품번' in ld.columns:
+                    hit = ld[ld['품번'].astype(str).str.strip().str.upper().eq(model)]
+                    if len(hit):
+                        lr = hit.iloc[0]
+                        fresh_buy = won_to_num(lr.get('현재가'))
+                        if fresh_buy and fresh_buy > 0:
+                            current_buy = fresh_buy
+                            current_url = str(lr.get('링크','') or current_url)
+                            lotte_status = '✅ 롯데 현재가 재확인'
+            if lotte_status.startswith('⚠️'):
+                messages.append(f'{model}: 롯데 현재가 자동 재확인 실패')
+        except Exception as e:
+            messages.append(f'{model}: 롯데 재조회 실패 - {str(e)[:120]}')
+
+        if not model or not current_buy:
+            rows.append({**old.to_dict(), '최종재검증':'🔴 구매금지',
+                         '재검증사유':'품번 또는 현재 매입가 확인 실패',
+                         '재검증시각':pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+                         '롯데재검증':lotte_status})
+            continue
+
+        upsert_product(model, int(current_buy), name)
+
+        p_df = pd.DataFrame()
+        poizon_status = '⚠️ POIZON 미확인'
+        try:
+            p_df, _, _ = poizon_lookup_article_official(model)
+            if p_df is not None and len(p_df):
+                upsert_platform_cache(p_df, POIZON_CACHE_PATH)
+                poizon_status = f'✅ POIZON 재확인 {len(p_df)}사이즈'
+            else:
+                messages.append(f'{model}: POIZON 최신 데이터 없음')
+        except Exception as e:
+            messages.append(f'{model}: POIZON 재조회 실패 - {str(e)[:120]}')
+
+        k_df = pd.DataFrame()
+        kream_status = '⚠️ KREAM 미확인'
+        try:
+            _, _, k_df = kream_auto_lookup_hard_timeout(model, hard_timeout_sec=18)
+            if k_df is not None and len(k_df):
+                upsert_platform_cache(k_df, KREAM_CACHE_PATH)
+                remove_kream_retry(model)
+                kream_status = f'✅ KREAM 재확인 {len(k_df)}사이즈'
+        except Exception as e:
+            enqueue_kream_retry(model, brand, name, current_buy, current_url, str(e))
+            messages.append(f'{model}: KREAM 재조회 미확인 - {str(e)[:100]}')
+            k_df = pd.DataFrame()
+
+        base_all = load_db()
+        base_one = base_all[base_all['model'].astype(str).str.strip().str.upper().eq(model)].copy()
+
+        if base_one.empty or p_df is None or len(p_df) == 0:
+            rows.append({**old.to_dict(), '현재매입가':current_buy, '상품URL':current_url,
+                         '최종재검증':'🔴 구매금지',
+                         '재검증사유':'POIZON 최신 판매가/판매량 확인 실패',
+                         '재검증시각':pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+                         '롯데재검증':lotte_status, 'POIZON재검증':poizon_status,
+                         'KREAM재검증':kream_status})
+            continue
+
+        pjudge = p_df.copy()
+        if 'poizon_30d_sales' in pjudge.columns:
+            psales = pd.to_numeric(pjudge['poizon_30d_sales'], errors='coerce')
+        else:
+            psales = pd.Series([None] * len(pjudge), index=pjudge.index)
+        valid = psales.fillna(0) > 0
+        for pc in ['poizon_buyer_price','poizon_avg_price']:
+            if pc in pjudge.columns:
+                pjudge.loc[~valid, pc] = None
+
+        cmp = compute_compare(base_one, kream=k_df, poizon=pjudge)
+        if cmp is None or len(cmp) == 0:
+            rows.append({**old.to_dict(), '현재매입가':current_buy, '상품URL':current_url,
+                         '최종재검증':'🔴 구매금지', '재검증사유':'최신 데이터 비교결과 없음',
+                         '재검증시각':pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+                         '롯데재검증':lotte_status, 'POIZON재검증':poizon_status,
+                         'KREAM재검증':kream_status})
+            continue
+
+        rank = {'🟢🟢 강력매입':0,'🟢 매입추천':1,'🟠 1개 테스트':2,'🟡 관찰':3,'🔴 PASS':4,'⚪ 데이터부족':5}
+        cc = cmp.copy()
+        cc['_rank'] = cc['판정'].map(rank).fillna(9)
+        cc['_profit'] = pd.to_numeric(cc.get('best_profit'), errors='coerce')
+        cc['_sales'] = pd.to_numeric(cc.get('best_30d_sales'), errors='coerce')
+        cc = cc.sort_values(['_rank','_profit','_sales'], ascending=[True,False,False], na_position='last')
+        best = cc.iloc[0]
+        grade = str(best.get('판정',''))
+
+        if lotte_status.startswith('⚠️'):
+            final_action, reason = '🔴 구매금지', '롯데 결제 직전 현재가 자동확인 실패'
+        elif grade in ('🟢🟢 강력매입','🟢 매입추천'):
+            final_action, reason = '🟢 지금 구매', str(best.get('판정이유',''))
+        elif grade == '🟠 1개 테스트':
+            final_action, reason = '🟠 1개 테스트', str(best.get('판정이유',''))
+        else:
+            final_action, reason = '🔴 구매금지', str(best.get('판정이유','')) or grade
+
+        rows.append({
+            **old.to_dict(), '현재매입가':int(current_buy), '상품URL':current_url,
+            'KR사이즈':best.get('size', old.get('KR사이즈','')),
+            '추천판매처':best.get('best_platform',''),
+            '최고예상순익':best.get('best_profit'), '최고ROI(%)':best.get('best_roi'),
+            '추천처30일판매':best.get('best_30d_sales'),
+            '권장최대매입가':best.get('권장최대매입가'),
+            '최종재검증':final_action, '재검증사유':reason,
+            '재검증시각':pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'),
+            '롯데재검증':lotte_status, 'POIZON재검증':poizon_status,
+            'KREAM재검증':kream_status,
+        })
+
+    return pd.DataFrame(rows), messages
+# ===== END V20.5 FINAL REVALIDATION =====
+
 tf,tl,t0,t1,t2,t3,t4,t5,t6=st.tabs(['📸 현장 카메라','🛍️ 롯데 자동소싱','🔥 POIZON 후보발굴','① 상품등록','② POIZON 가져오기','③ KREAM 가져오기','④ 자동 비교','⑤ 사용법','⑥ 오늘 살 것'])
 
 
@@ -4058,7 +4200,7 @@ with t5:
 ''')
 
 with t6:
-    st.subheader('🛒 오늘 살 것 V20.3')
+    st.subheader('🛒 오늘 살 것 V20.5')
     st.caption(
         '저장 후보 + 현재 롯데 자동소싱 결과를 한곳에 모아 '
         '수익성·ROI·30일 판매량·판정등급을 함께 보고 예산 안에서 오늘 살 상품을 자동선정합니다. '
@@ -4393,6 +4535,62 @@ with t6:
                         '상품URL': st.column_config.LinkColumn('상품', display_text='열기'),
                     }
                 )
+
+
+                # =====================================================
+                # 6.5) V20.5 결제 직전 최종 재검증
+                # =====================================================
+                st.markdown('### 🔄 결제 직전 최종 재검증')
+                st.caption(
+                    '실제 결제 직전에만 누르세요. 롯데 현재가 → POIZON 공식 최신 데이터 → '
+                    'KREAM 가능 시 교차확인을 다시 수행하고 순익·ROI·판매량을 재계산합니다. '
+                    '롯데 현재가 또는 POIZON 최신 데이터 확인에 실패하면 자동으로 구매금지 처리합니다.'
+                )
+
+                if st.button('🔄 결제 직전 최종 재검증 실행', type='primary',
+                             width='stretch', key='v205_final_recheck_run'):
+                    if not len(buy_list):
+                        st.warning('재검증할 오늘 구매 후보가 없습니다.')
+                    else:
+                        with st.spinner('결제 직전 최신 가격/판매량을 다시 확인하는 중입니다...'):
+                            _final_check, _final_msgs = v20_5_final_revalidate(buy_list)
+                        st.session_state['v205_final_check'] = _final_check
+                        st.session_state['v205_final_msgs'] = _final_msgs
+
+                _final_check = st.session_state.get('v205_final_check', pd.DataFrame())
+                if isinstance(_final_check, pd.DataFrame) and len(_final_check):
+                    final_cols = [c for c in [
+                        '최종재검증','상품명','모델','KR사이즈','현재매입가',
+                        '추천판매처','최고예상순익','최고ROI(%)','추천처30일판매',
+                        '권장최대매입가','롯데재검증','POIZON재검증','KREAM재검증',
+                        '재검증사유','재검증시각','상품URL'
+                    ] if c in _final_check.columns]
+
+                    st.dataframe(
+                        _final_check[final_cols], width='stretch', hide_index=True,
+                        column_config={
+                            '현재매입가': st.column_config.NumberColumn(format='%,.0f원'),
+                            '최고예상순익': st.column_config.NumberColumn(format='%,.0f원'),
+                            '최고ROI(%)': st.column_config.NumberColumn(format='%.1f%%'),
+                            '추천처30일판매': st.column_config.NumberColumn(format='%d건'),
+                            '권장최대매입가': st.column_config.NumberColumn(format='%,.0f원'),
+                            '상품URL': st.column_config.LinkColumn('상품', display_text='열기'),
+                        }
+                    )
+
+                    _go = _final_check[_final_check['최종재검증'].isin(['🟢 지금 구매','🟠 1개 테스트'])]
+                    _stop = _final_check[_final_check['최종재검증'].eq('🔴 구매금지')]
+                    if len(_go):
+                        st.success(f'✅ 최종 통과 {len(_go)}개 · 이 목록만 실제 결제 후보로 사용하세요.')
+                    if len(_stop):
+                        st.error(f'🛑 구매금지 {len(_stop)}개 · 가격/판매량 재확인 전에는 결제하지 마세요.')
+
+                    _msgs = st.session_state.get('v205_final_msgs', []) or []
+                    if _msgs:
+                        with st.expander(f'재검증 로그 {len(_msgs)}건'):
+                            for _m in _msgs:
+                                st.write('• ' + str(_m))
+
 
                 # 예산 때문에 못 담은 후보도 따로 보여줌
                 waiting = working[working['오늘구매수량'] == 0].copy()
