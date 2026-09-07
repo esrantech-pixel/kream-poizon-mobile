@@ -48,7 +48,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.1', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.3', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -1336,7 +1336,7 @@ def kream_find_product_id(model):
     """
     V19.3.1
     Model/style code -> KREAM product id.
-    - KREAM search HTTP 500/502/503/504: automatic retry
+    - KREAM search HTTP 429/500/502/503/504: automatic retry + Retry-After support
     - fallback query variants: original, hyphen->space, hyphen removed
     - exact SKU verification on product PDP is still mandatory
     """
@@ -1366,9 +1366,14 @@ def kream_find_product_id(model):
                     headers=h,
                     timeout=15
                 )
-                if r.status_code in (500, 502, 503, 504):
+                if r.status_code in (429, 500, 502, 503, 504):
+                    retry_after = r.headers.get('Retry-After')
+                    try:
+                        wait_sec = min(float(retry_after), 8.0) if retry_after else (1.5 + attempt * 1.5)
+                    except Exception:
+                        wait_sec = 1.5 + attempt * 1.5
                     last_error = RuntimeError(f'KREAM 검색 HTTP {r.status_code}')
-                    time.sleep(1.0 + attempt * 0.8)
+                    time.sleep(wait_sec)
                     continue
                 if r.status_code >= 400:
                     last_error = RuntimeError(f'KREAM 검색 HTTP {r.status_code}')
@@ -1419,7 +1424,7 @@ def kream_find_product_id(model):
     if not search_html_list and last_error is not None:
         raise RuntimeError(
             f'KREAM 자동검색 일시 실패: {last_error}. '
-            f'3회 재시도와 검색어 변형({", ".join(query_variants)})까지 실패했습니다.'
+            f'3회 재시도와 검색어 변형({", ".join(query_variants)})까지 실패했습니다. KREAM 서버가 자동검색을 막거나 일시 오류를 낸 상태일 수 있습니다. 수동 URL/상품ID 입력으로 계속 진행하세요.'
         )
 
     raise RuntimeError(
@@ -2559,7 +2564,7 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
 
 
 st.title('KREAM · POIZON · COUPANG 소싱 V20.2')
-st.caption('Build: V20.2 · 100만원 예산 자동배분 + 상품당 투자비율 조절 + 예산 집행률/잔액 진단')
+st.caption('Build: V20.3 · KREAM 실패 안전처리 + 100만원 예산 자동배분 + 상품당 투자비율 조절 + 예산 집행률/잔액 진단')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -3919,7 +3924,7 @@ with t5:
 ''')
 
 with t6:
-    st.subheader('🛒 오늘 살 것 V20.2')
+    st.subheader('🛒 오늘 살 것 V20.3')
     st.caption(
         '저장 후보 + 현재 롯데 자동소싱 결과를 한곳에 모아 '
         '수익성·ROI·30일 판매량·판정등급을 함께 보고 예산 안에서 오늘 살 상품을 자동선정합니다. '
@@ -4192,7 +4197,7 @@ with t6:
                 # 5) 한눈에 보는 오늘 결론
                 # =====================================================
                 st.markdown('### ✅ 오늘 결론')
-                m1,m2,m3,m4,m5 = st.columns(5)
+                m1,m2,m3,m4,m5,m6 = st.columns(6)
                 m1.metric('조건 통과 후보', f'{len(working)}개')
                 m2.metric('오늘 구매수량', f'{total_qty}개')
                 m3.metric('예상 매입금액', f'{total_cost:,.0f}원')
@@ -4207,7 +4212,7 @@ with t6:
                 if total_cost > 0:
                     st.success(
                         f'예상 종합 ROI {blended_roi:.1f}% · '
-                        f'실전점수·예산·상품당 최대 25% 투자한도를 함께 반영한 순서입니다.'
+                        f'실전점수·예산·상품당 최대 {today_max_product_pct:.0f}% 투자한도를 함께 반영한 순서입니다.'
                     )
 
                     top = buy_list.iloc[0]
@@ -4296,7 +4301,7 @@ with t6:
                     key='telegram_today_v20'
                 ):
                     ok, msg = send_telegram_message(
-                        candidate_telegram_text(buy_list, '🛒 V20.2 오늘 살 것')
+                        candidate_telegram_text(buy_list, '🛒 V20.3 오늘 살 것')
                     )
                     (st.success if ok else st.error)(msg)
 
@@ -4335,5 +4340,5 @@ with t6:
                     )
 
     except Exception as e:
-        st.error(f'V20.2 오늘 살 것 계산 중 오류가 발생했습니다: {e}')
+        st.error(f'V20.3 오늘 살 것 계산 중 오류가 발생했습니다: {e}')
 
