@@ -48,7 +48,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.5', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.6', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -104,6 +104,9 @@ DEFAULT_SETTINGS = {
     'target_profit': 15000,
     'target_roi': 20.0,
     'min_30d_sales': 2,
+    'coupang_fee_rate': 0.108,
+    'coupang_shipping_cost': 3500,
+    'coupang_extra_cost': 0,
 }
 
 if 'settings' not in st.session_state:
@@ -2658,8 +2661,8 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V20.5')
-st.caption('Build: V20.5 · 결제 직전 최종 재검증 + POIZON 결과보존 + 100만원 실전 자동배분')
+st.title('KREAM · POIZON · COUPANG 소싱 V20.6')
+st.caption('Build: V20.6 · 쿠팡 판매가 수동입력 비교 + POIZON/KREAM 교차판정 + 결제 직전 재검증')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2669,6 +2672,9 @@ with st.sidebar:
     s['packing_cost']=st.number_input('포장/기타비(원)',0,50000,int(s['packing_cost']),500)
     s['kream_fee_rate']=st.number_input('KREAM 수수료율',0.0,0.5,float(s['kream_fee_rate']),0.005,format='%.3f')
     s['poizon_fee_rate']=st.number_input('POIZON 추정 수수료율',0.0,0.5,float(s['poizon_fee_rate']),0.005,format='%.3f')
+    s['coupang_fee_rate']=st.number_input('쿠팡 예상 수수료율',0.0,0.5,float(s.get('coupang_fee_rate',0.108)),0.005,format='%.3f')
+    s['coupang_shipping_cost']=st.number_input('쿠팡 건당 배송비(원)',0,100000,int(s.get('coupang_shipping_cost',3500)),500)
+    s['coupang_extra_cost']=st.number_input('쿠팡 기타비용(원)',0,100000,int(s.get('coupang_extra_cost',0)),500)
     s['target_profit']=st.number_input('추천 최소 순익',0,200000,int(s['target_profit']),1000)
     s['target_roi']=st.number_input('추천 최소 ROI(%)',0.0,200.0,float(s['target_roi']),1.0)
     s['min_30d_sales']=st.number_input('추천 최소 30일 판매량',0,100000,int(s['min_30d_sales']),10)
@@ -2816,7 +2822,7 @@ def v20_5_final_revalidate(today_buy_df):
     return pd.DataFrame(rows), messages
 # ===== END V20.5 FINAL REVALIDATION =====
 
-tf,tl,t0,t1,t2,t3,t4,t5,t6=st.tabs(['📸 현장 카메라','🛍️ 롯데 자동소싱','🔥 POIZON 후보발굴','① 상품등록','② POIZON 가져오기','③ KREAM 가져오기','④ 자동 비교','⑤ 사용법','⑥ 오늘 살 것'])
+tf,tl,t0,t1,t2,t3,t4,t5,t6,t7=st.tabs(['📸 현장 카메라','🛍️ 롯데 자동소싱','🔥 POIZON 후보발굴','① 상품등록','② POIZON 가져오기','③ KREAM 가져오기','④ 자동 비교','⑤ 사용법','⑥ 오늘 살 것','⑦ 쿠팡 비교'])
 
 
 with tf:
@@ -4674,3 +4680,108 @@ with t6:
     except Exception as e:
         st.error(f'V20.3 오늘 살 것 계산 중 오류가 발생했습니다: {e}')
 
+
+
+# ===== V20.6 COUPANG MANUAL PROFIT COMPARISON =====
+with t7:
+    st.subheader('🟦 쿠팡 판매 비교 V20.6')
+    st.caption('쿠팡의 실제 판매가를 직접 입력하면 수수료·배송비·기타비용을 차감해 순익과 ROI를 계산하고, 현재 POIZON/KREAM 후보와 비교합니다. 자동 가격수집 전 안전한 1단계입니다.')
+
+    _cand_path = DATA_DIR / 'sourcing_candidates.csv'
+    _frames = []
+    if _cand_path.exists():
+        try:
+            _d = pd.read_csv(_cand_path)
+            if len(_d): _frames.append(_d)
+        except Exception:
+            pass
+    _x = st.session_state.get('v193_kream_cross_result', pd.DataFrame())
+    if isinstance(_x, pd.DataFrame) and len(_x):
+        _frames.append(pd.DataFrame({
+            '상품명':_x.get('상품명'), '모델':_x.get('품번'), 'KR사이즈':_x.get('BEST사이즈'),
+            '현재매입가':_x.get('롯데매입가'), '추천판매처':_x.get('추천판매처'),
+            '최고예상순익':_x.get('예상순이익'), '최고ROI(%)':_x.get('ROI(%)'),
+            '추천처30일판매':_x.get('30일판매')
+        }))
+    _b = st.session_state.get('v191_lotte_batch_result', pd.DataFrame())
+    if not _frames and isinstance(_b, pd.DataFrame) and len(_b):
+        _frames.append(pd.DataFrame({
+            '상품명':_b.get('상품명'), '모델':_b.get('품번'), 'KR사이즈':_b.get('BEST사이즈'),
+            '현재매입가':_b.get('롯데매입가'), '추천판매처':'POIZON',
+            '최고예상순익':_b.get('예상순이익'), '최고ROI(%)':_b.get('ROI(%)'),
+            '추천처30일판매':_b.get('30일판매')
+        }))
+
+    _base = pd.concat(_frames, ignore_index=True, sort=False) if _frames else pd.DataFrame()
+    if len(_base):
+        for _c in ['상품명','모델','KR사이즈','현재매입가','추천판매처','최고예상순익','최고ROI(%)','추천처30일판매']:
+            if _c not in _base.columns: _base[_c] = ''
+        _base = _base.drop_duplicates(subset=['모델','KR사이즈'], keep='last').reset_index(drop=True)
+        _labels = [f"{r.get('모델','')} | KR {r.get('KR사이즈','')} | {r.get('상품명','')}" for _,r in _base.iterrows()]
+        _sel = st.selectbox('비교할 상품', range(len(_labels)), format_func=lambda i:_labels[i], key='v206_cp_sel')
+        _r = _base.iloc[int(_sel)]
+        _default_buy = int(won_to_num(_r.get('현재매입가')) or 0)
+    else:
+        st.info('저장 후보가 없어도 아래에서 품번과 매입가를 직접 입력해 계산할 수 있습니다.')
+        _r = pd.Series(dtype=object)
+        _default_buy = 0
+
+    c1,c2,c3 = st.columns(3)
+    with c1:
+        cp_model = st.text_input('품번', value=str(_r.get('모델','') or ''), key='v206_cp_model').strip().upper()
+    with c2:
+        cp_size = st.text_input('KR 사이즈', value=str(_r.get('KR사이즈','') or ''), key='v206_cp_size')
+    with c3:
+        cp_buy = st.number_input('실제 매입가(원)', min_value=0, value=max(_default_buy,0), step=1000, key='v206_cp_buy')
+
+    c4,c5,c6 = st.columns(3)
+    with c4:
+        cp_sell = st.number_input('쿠팡 판매가(원)', min_value=0, value=0, step=1000, key='v206_cp_sell')
+    with c5:
+        cp_fee_pct = st.number_input('쿠팡 수수료(%)', min_value=0.0, max_value=50.0, value=float(st.session_state.settings.get('coupang_fee_rate',0.108))*100, step=0.5, key='v206_cp_fee')
+    with c6:
+        cp_ship = st.number_input('쿠팡 배송비/건(원)', min_value=0, value=int(st.session_state.settings.get('coupang_shipping_cost',3500)), step=500, key='v206_cp_ship')
+    cp_extra = st.number_input('쿠팡 기타비용/건(광고·포장·반품충당 등, 원)', min_value=0, value=int(st.session_state.settings.get('coupang_extra_cost',0)), step=500, key='v206_cp_extra')
+
+    if cp_sell > 0 and cp_buy > 0:
+        cp_fee = float(cp_sell) * float(cp_fee_pct)/100.0
+        cp_net = float(cp_sell) - cp_fee - float(cp_ship) - float(cp_extra)
+        cp_profit = cp_net - float(cp_buy)
+        cp_roi = cp_profit / float(cp_buy) * 100.0
+        cp_max = calc_max_buy_price(cp_sell, float(cp_fee_pct)/100.0, cp_ship, cp_extra,
+                                    st.session_state.settings['target_profit'], st.session_state.settings['target_roi'])
+        m1,m2,m3,m4,m5 = st.columns(5)
+        m1.metric('쿠팡 판매가', f'{cp_sell:,.0f}원')
+        m2.metric('예상 수수료', f'{cp_fee:,.0f}원')
+        m3.metric('쿠팡 예상 순익', f'{cp_profit:,.0f}원')
+        m4.metric('쿠팡 ROI', f'{cp_roi:.1f}%')
+        m5.metric('권장 최대 매입가', f'{cp_max:,.0f}원' if cp_max is not None else '-')
+
+        old_profit = won_to_num(_r.get('최고예상순익')) if len(_r) else None
+        try: old_roi = float(_r.get('최고ROI(%)')) if pd.notna(_r.get('최고ROI(%)')) else None
+        except Exception: old_roi = None
+        old_market = str(_r.get('추천판매처','') or 'POIZON/KREAM') if len(_r) else 'POIZON/KREAM'
+
+        if old_profit is not None:
+            if cp_profit > old_profit:
+                st.success(f'🏆 COUPANG 우선 · 쿠팡 예상순익이 {old_market}보다 {cp_profit-old_profit:,.0f}원 높습니다.')
+            else:
+                st.info(f'🏆 {old_market} 우선 · 기존 예상순익이 쿠팡보다 {old_profit-cp_profit:,.0f}원 높습니다.')
+            _cmp = pd.DataFrame([
+                {'판매처':old_market,'예상순익':old_profit,'ROI(%)':old_roi},
+                {'판매처':'COUPANG','예상순익':cp_profit,'ROI(%)':cp_roi},
+            ])
+            st.dataframe(_cmp, width='stretch', hide_index=True,
+                         column_config={'예상순익':st.column_config.NumberColumn(format='%,.0f원'), 'ROI(%)':st.column_config.NumberColumn(format='%.1f%%')})
+        else:
+            if cp_profit >= st.session_state.settings['target_profit'] and cp_roi >= st.session_state.settings['target_roi']:
+                st.success('🟢 쿠팡 수익성 기준 통과 · 판매량/경쟁 셀러를 확인한 뒤 1개 테스트 후보로 검토하세요.')
+            elif cp_profit > 0:
+                st.warning('🟡 이익은 나지만 현재 목표 순익/ROI 기준에는 미달합니다.')
+            else:
+                st.error('🔴 쿠팡 판매 시 예상 손실입니다. 매입하지 않는 편이 안전합니다.')
+
+        st.warning('쿠팡 판매량·광고비·반품비·카테고리별 실제 수수료는 아직 자동 확인하지 않습니다. 실제 등록/매입 전 판매자센터의 적용 수수료와 경쟁상황을 확인하세요.')
+    else:
+        st.info('쿠팡 판매가와 실제 매입가를 입력하면 바로 비교됩니다.')
+# ===== END V20.6 COUPANG MANUAL PROFIT COMPARISON =====
