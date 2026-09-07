@@ -2375,7 +2375,7 @@ def v19_1_lotte_poizon_batch(source_df, max_products=10):
 
 def kream_auto_lookup_hard_timeout(model, hard_timeout_sec=18):
     """
-    V19.3.2
+    V20.4
     KREAM 자동검색+사이즈조회 전체를 hard timeout으로 감싼다.
     시간이 넘으면 현재 상품은 즉시 'KREAM 미확인'으로 넘기고
     POIZON 1차판정 결과를 보존한다.
@@ -2402,6 +2402,65 @@ def kream_auto_lookup_hard_timeout(model, hard_timeout_sec=18):
         # 핵심: 실행 중인 네트워크 스레드를 기다리지 않고 UI를 즉시 반환
         executor.shutdown(wait=False, cancel_futures=True)
 
+
+
+# ===== V20.4 KREAM 재조회 대기열 =====
+KREAM_RETRY_QUEUE_PATH = DATA_DIR / 'kream_retry_queue.csv'
+
+def load_kream_retry_queue():
+    cols = ['모델','브랜드','상품명','롯데매입가','상품URL','실패원인','시도횟수','마지막시도']
+    if not KREAM_RETRY_QUEUE_PATH.exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        q = pd.read_csv(KREAM_RETRY_QUEUE_PATH)
+        for c in cols:
+            if c not in q.columns:
+                q[c] = ''
+        return q[cols]
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+def save_kream_retry_queue(df):
+    KREAM_RETRY_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if df is None or len(df) == 0:
+        pd.DataFrame(columns=['모델','브랜드','상품명','롯데매입가','상품URL','실패원인','시도횟수','마지막시도']).to_csv(
+            KREAM_RETRY_QUEUE_PATH, index=False, encoding='utf-8-sig'
+        )
+        return
+    df.to_csv(KREAM_RETRY_QUEUE_PATH, index=False, encoding='utf-8-sig')
+
+def enqueue_kream_retry(model, brand='', name='', buy=0, url='', error_text=''):
+    model = str(model or '').strip().upper()
+    if not model:
+        return
+    q = load_kream_retry_queue()
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    hit = q['모델'].astype(str).str.upper().eq(model) if len(q) else pd.Series([], dtype=bool)
+    if len(q) and hit.any():
+        idx = q.index[hit][0]
+        old = pd.to_numeric(pd.Series([q.at[idx,'시도횟수']]), errors='coerce').fillna(0).iloc[0]
+        q.at[idx,'브랜드'] = brand
+        q.at[idx,'상품명'] = name
+        q.at[idx,'롯데매입가'] = int(buy or 0)
+        q.at[idx,'상품URL'] = url
+        q.at[idx,'실패원인'] = str(error_text)[:300]
+        q.at[idx,'시도횟수'] = int(old) + 1
+        q.at[idx,'마지막시도'] = now
+    else:
+        q = pd.concat([q, pd.DataFrame([{
+            '모델':model, '브랜드':brand, '상품명':name,
+            '롯데매입가':int(buy or 0), '상품URL':url,
+            '실패원인':str(error_text)[:300], '시도횟수':1, '마지막시도':now
+        }])], ignore_index=True)
+    q = q.drop_duplicates(subset=['모델'], keep='last')
+    save_kream_retry_queue(q)
+
+def remove_kream_retry(model):
+    model = str(model or '').strip().upper()
+    q = load_kream_retry_queue()
+    if len(q):
+        q = q[~q['모델'].astype(str).str.upper().eq(model)].reset_index(drop=True)
+        save_kream_retry_queue(q)
 
 def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     """POIZON 1차 매입후보만 KREAM 자동조회 후 동일 KR사이즈로 최종 교차판정."""
@@ -2467,16 +2526,51 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
             if kauto is None or len(kauto) == 0:
                 raise RuntimeError('사이즈별 입찰/체결 데이터 없음')
             upsert_platform_cache(kauto, KREAM_CACHE_PATH)
+            remove_kream_retry(model)
             kstatus = f'✅ 자동연결 {len(kauto)}사이즈'
         except TimeoutError as e:
-            kstatus = '⏱️ KREAM 시간초과 / 자동건너뜀'
+            kstatus = '⏱️ KREAM 시간초과 / POIZON으로 계속'
             messages.append(f'{model}: {str(e)}')
+            enqueue_kream_retry(model, brand, name, buy, url, str(e))
             kauto = pd.DataFrame()
             kpid = ''
         except Exception as e:
-            kstatus = '⚠️ KREAM 자동조회 실패'
+            kstatus = '⚠️ KREAM 실패 / POIZON으로 계속'
             messages.append(f'{model}: KREAM 자동조회 실패 - {str(e)[:180]}')
+            enqueue_kream_retry(model, brand, name, buy, url, str(e))
             kauto = pd.DataFrame()
+
+        # V20.4 핵심:
+        # KREAM이 실패해도 POIZON 1차판정 결과를 그대로 보존해서
+        # '오늘 살 것'과 100만원 예산배분이 중단되지 않게 한다.
+        if not len(kauto):
+            result_rows.append({
+                '브랜드':brand,
+                '품번':model,
+                '상품명':name,
+                '롯데매입가':int(buy),
+                '최종판정':src_row.get('최종판정'),
+                'BEST사이즈':str(src_row.get('BEST사이즈','')),
+                '추천판매처':'POIZON 우선 / KREAM 미확인',
+                '판매기준가':src_row.get('POIZON기준가'),
+                '예상순이익':src_row.get('예상순이익'),
+                'ROI(%)':src_row.get('ROI(%)'),
+                '30일판매':src_row.get('30일판매'),
+                '추천수량':int(src_row.get('추천수량',0) or 0),
+                '권장최대매입가':src_row.get('권장최대매입가'),
+                'POIZON기준가':src_row.get('POIZON기준가'),
+                'POIZON30일':src_row.get('30일판매'),
+                'KREAM즉시판매':None,
+                'KREAM최근체결':None,
+                'KREAM30일':None,
+                'KREAM가격검사':None,
+                'KREAM상태':kstatus,
+                'KREAM상품ID':'',
+                '교차검증상태':'KREAM 미확인 · 재조회 대기',
+                '이유':str(src_row.get('이유','')) + ' / KREAM 미확인',
+                '롯데상품':url
+            })
+            continue
 
         cmp = compute_compare(
             base_one,
@@ -2545,6 +2639,7 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
             'KREAM가격검사':best.get('kream_price_check'),
             'KREAM상태':kstatus or '미조회',
             'KREAM상품ID':kpid,
+            '교차검증상태':('완료' if len(kauto) else 'KREAM 미확인'),
             '이유':str(best.get('판정이유','')),
             '롯데상품':url
         })
@@ -2563,8 +2658,8 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V20.3')
-st.caption('Build: V20.3 · KREAM 실패 안전처리 + 100만원 예산 자동배분 + 상품당 투자비율 조절 + 예산 집행률/잔액 진단')
+st.title('KREAM · POIZON · COUPANG 소싱 V20.4')
+st.caption('Build: V20.4 · KREAM 실패 자동우회 + 재조회 대기열 + POIZON 결과보존 + 100만원 실전 자동배분')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2715,7 +2810,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V19.3.2')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V20.4')
     st.caption('아디다스·나이키 후보를 수집한 뒤 품번별 POIZON 공식 API를 일괄 조회해 1차 소싱 후보를 자동 판정합니다. KREAM·쿠팡은 다음 단계에서 BEST 판매처 교차비교로 확장합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -2847,7 +2942,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
 
-        st.markdown('#### 🚀 V19.3.2 롯데 후보 → POIZON 1차판정')
+        st.markdown('#### 🚀 V20.4 롯데 후보 → POIZON 1차판정')
         st.caption('롯데에서 잡힌 아디다스·나이키 품번을 POIZON 공식 API로 순차 조회해 실제 판매량이 있는 가격만으로 소싱 가능성을 판정합니다.')
         bc1,bc2=st.columns([1,3])
         _batch_n=bc1.number_input(
@@ -2902,7 +2997,7 @@ with tl:
             else:
                 st.warning('이번 검사 상품에서는 POIZON 기준 매입후보가 없습니다.')
 
-            st.markdown('#### 🔁 V19.3.2 POIZON 매입후보 → KREAM 자동 교차검증')
+            st.markdown('#### 🔁 V20.4 POIZON 매입후보 → KREAM 자동 교차검증')
             st.caption(
                 'POIZON 1차판정에서 살아남은 상품만 KREAM에서 정확 품번으로 자동 매칭합니다. '
                 '같은 KR 사이즈끼리 즉시판매가·최근체결가·30일 판매량을 비교해 최종 BEST 판매처를 고릅니다.'
@@ -2922,6 +3017,45 @@ with tl:
                 st.info('POIZON 매입후보가 생기면 KREAM 자동 교차검증 버튼이 활성화됩니다.')
 
             _xout = st.session_state.get('v193_kream_cross_result', pd.DataFrame())
+
+            # ===== V20.4 KREAM 재조회 대기열 =====
+            _rq = load_kream_retry_queue()
+            if len(_rq):
+                st.warning(f'🔄 KREAM 재조회 대기 {len(_rq)}개 · 실패해도 POIZON 판정/오늘 살 것은 계속 사용됩니다.')
+                with st.expander('KREAM 재조회 대기열 보기'):
+                    st.dataframe(_rq, width='stretch', hide_index=True)
+
+                if len(_buyable):
+                    _retry_models = set(_rq['모델'].astype(str).str.upper().tolist())
+                    _retry_src = _buyable[
+                        _buyable['품번'].astype(str).str.upper().isin(_retry_models)
+                    ].copy().head(5)
+
+                    if len(_retry_src) and st.button(
+                        f'🔄 KREAM 미확인 {_retry_src.shape[0]}개 다시 조회',
+                        width='stretch',
+                        key='v204_kream_retry_queue_run'
+                    ):
+                        with st.spinner('KREAM 재조회 중... 실패하면 다시 대기열에 남기고 POIZON 결과는 유지합니다.'):
+                            _retry_out, _retry_msg = v19_3_kream_cross_batch(
+                                _retry_src, max_products=len(_retry_src)
+                            )
+
+                        _old = st.session_state.get('v193_kream_cross_result', pd.DataFrame())
+                        if isinstance(_old, pd.DataFrame) and len(_old):
+                            _keep = _old[
+                                ~_old['품번'].astype(str).str.upper().isin(
+                                    set(_retry_src['품번'].astype(str).str.upper())
+                                )
+                            ].copy()
+                            _merged = pd.concat([_keep, _retry_out], ignore_index=True, sort=False)
+                        else:
+                            _merged = _retry_out
+
+                        st.session_state['v193_kream_cross_result'] = _merged
+                        st.session_state['v193_kream_cross_messages'] = _retry_msg
+                        st.rerun()
+
             if isinstance(_xout, pd.DataFrame) and len(_xout):
                 _xaction = _xout[_xout['최종판정'].isin(
                     ['🟢🟢 강력매입','🟢 매입추천','🟠 1개 테스트']
@@ -2980,7 +3114,7 @@ with tl:
                     st.caption(str(_m))
 
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 상세 확인 · V19.3.2')
+        st.markdown('#### 🧪 1개 상품 상세 확인 · V20.4')
         st.caption('후보 1개를 골라 POIZON 공식 API로 상세검증하고, 아래 KREAM 자동 교차검증으로 동일 품번·동일 KR사이즈를 다시 확인합니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
@@ -3093,7 +3227,7 @@ with tl:
                             else:
                                 st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 판매량 없는 POIZON 가격은 수익 계산에서 제외했습니다.')
 
-                    st.markdown('##### 🔁 V19.3.2 KREAM 자동 교차검증')
+                    st.markdown('##### 🔁 V20.4 KREAM 자동 교차검증')
                     st.caption('같은 품번을 KREAM에서 자동 매칭해 즉시판매가(최고 매입입찰)·30일 체결을 가져오고 POIZON과 같은 사이즈로 비교합니다.')
                     if st.button('🔎 KREAM 자동조회 + POIZON 교차비교', type='primary', width='stretch', key='lotte_v188_kream_auto'):
                         try:
