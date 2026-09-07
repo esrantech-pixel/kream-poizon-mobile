@@ -48,7 +48,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.7', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.7.1', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -2708,8 +2708,8 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V20.7')
-st.caption('Build: V20.7 · 쿠팡 검색 바로가기 + 확인값 저장 + POIZON/KREAM/COUPANG 3곳 최종판정')
+st.title('KREAM · POIZON · COUPANG 소싱 V20.7.1')
+st.caption('Build: V20.7.1 · 쿠팡 홈 열기 + 검색어 표시 + 확인값 저장 + POIZON/KREAM/COUPANG 3곳 최종판정')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -4729,9 +4729,9 @@ with t6:
 
 
 
-# ===== V20.7 COUPANG PRACTICAL MANUAL CHECK + FINAL MARKET DECISION =====
+# ===== V20.7.1 COUPANG HOME + MANUAL SEARCH + FINAL MARKET DECISION =====
 with t7:
-    st.subheader('🟦 쿠팡 실전 비교 V20.7')
+    st.subheader('🟦 쿠팡 실전 비교 V20.7.1')
     st.caption(
         '품번으로 쿠팡 검색을 바로 열고, 동일 품번/사이즈의 실제 판매가를 확인한 뒤 '
         '수수료·배송비·기타비용을 반영해 POIZON/KREAM과 최종 비교합니다. '
@@ -4805,18 +4805,26 @@ with t7:
             step=1000, key='v207_cp_buy'
         )
 
-    # 1) Coupang search shortcut
+    # 1) Coupang manual search helper
     if cp_model:
-        _q = urllib.parse.quote(f'{cp_model} {cp_size}'.strip())
-        _cp_search_url = f'https://www.coupang.com/np/search?q={_q}'
+        _search_text = f'{cp_model} {cp_size}'.strip()
+        st.markdown('### 🔎 쿠팡 검색')
+        st.code(_search_text, language=None)
+        st.caption(
+            '위 검색어를 복사한 뒤 쿠팡 검색창에 붙여넣으세요. '
+            '쿠팡은 외부 검색 URL을 차단하는 경우가 있어 홈 화면만 엽니다.'
+        )
         st.link_button(
-            f'🔎 쿠팡에서 {cp_model} 검색 열기',
-            _cp_search_url,
+            '🛒 쿠팡 홈 열기',
+            'https://www.coupang.com/',
             width='stretch'
         )
-        st.caption('쿠팡에서 반드시 동일 품번·동일 사이즈인지 확인한 뒤 아래 판매가를 입력하세요.')
+        st.info(
+            f'검색어: {_search_text} · 쿠팡에서 동일 품번·동일 사이즈인지 확인한 뒤 '
+            '아래 판매가와 경쟁 판매자 수를 입력하세요.'
+        )
     else:
-        st.info('품번을 입력하면 쿠팡 검색 바로가기가 나타납니다.')
+        st.info('품번을 입력하면 쿠팡 검색어와 홈 열기 버튼이 나타납니다.')
 
     # Previous saved check for this exact model+size
     _saved = load_coupang_manual()
@@ -5001,4 +5009,4 @@ with t7:
         with st.expander('📚 저장된 쿠팡 확인 기록 보기'):
             st.dataframe(_saved.tail(50), width='stretch', hide_index=True)
 
-# ===== END V20.7 COUPANG PRACTICAL MANUAL CHECK + FINAL MARKET DECISION =====
+# ===== END V20.7.1 COUPANG HOME + MANUAL SEARCH + FINAL MARKET DECISION =====
