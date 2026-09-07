@@ -48,7 +48,7 @@ def v19_normalize_source_row(source, brand="", model="", name="", gender="",
 # ===== END V19.0 MULTI-SOURCE FRAMEWORK =====
 
 
-st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.0', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='KREAM · POIZON · COUPANG 소싱 V20.1', layout='wide', initial_sidebar_state='collapsed')
 
 # ---- V13 FIELD: mobile access protection + field layout ----
 def _check_app_password():
@@ -2559,7 +2559,7 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
 
 
 st.title('KREAM · POIZON · COUPANG 소싱 V20.0')
-st.caption('Build: V20.0 · 오늘 살 것 자동선정 + 예산배분 + BEST 사이즈/판매처/수익/회전 통합')
+st.caption('Build: V20.1 · 100만원 예산 자동배분 + 상품당 투자한도 + BEST 사이즈/판매처/수익/회전 통합')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -3919,7 +3919,7 @@ with t5:
 ''')
 
 with t6:
-    st.subheader('🛒 오늘 살 것 V20.0')
+    st.subheader('🛒 오늘 살 것 V20.1')
     st.caption(
         '저장 후보 + 현재 롯데 자동소싱 결과를 한곳에 모아 '
         '수익성·ROI·30일 판매량·판정등급을 함께 보고 예산 안에서 오늘 살 상품을 자동선정합니다. '
@@ -4044,7 +4044,7 @@ with t6:
             with c_budget:
                 today_budget = st.number_input(
                     '오늘 매입 예산(원)',
-                    min_value=0, value=300000, step=50000,
+                    min_value=0, value=1000000, step=50000,
                     key='today_budget_v20'
                 )
             with c_roi:
@@ -4125,23 +4125,37 @@ with t6:
                 ).reset_index(drop=True)
 
                 # =====================================================
-                # 4) 예산 자동배분
+                # 4) V20.1 예산 자동배분
+                #    - 기본 예산 100만원
+                #    - 한 상품에 전체 예산의 최대 25%까지만 배분
+                #    - 1개 테스트 판정은 무조건 최대 1개
+                #    - 추천수량/판매량보다 과도하게 사지 않도록 제한
                 # =====================================================
+                max_product_ratio = 0.25
                 remaining = int(today_budget)
                 budget_qty = []
 
                 for _, r in working.iterrows():
                     unit = int(r['현재매입가']) if pd.notna(r['현재매입가']) else 0
                     want = int(r['추천구매수량']) if pd.notna(r['추천구매수량']) else 0
+                    sales = int(r['추천처30일판매']) if pd.notna(r['추천처30일판매']) else 0
+
+                    # 상품별 투자 상한: 전체 예산의 25%
+                    product_cap = int(today_budget * max_product_ratio)
+                    cap_qty = (product_cap // unit) if unit > 0 else 0
 
                     # 1개 테스트는 반드시 최대 1개
                     if str(r.get('판정','')) == '🟠 1개 테스트':
                         want = min(want, 1)
+                    else:
+                        # 회전량보다 추천수량이 커지는 상황 방지
+                        if sales > 0:
+                            want = min(want, sales)
 
                     if unit <= 0 or want <= 0 or remaining < unit:
                         q = 0
                     else:
-                        q = min(want, remaining // unit)
+                        q = min(want, remaining // unit, cap_qty)
 
                     budget_qty.append(int(q))
                     remaining -= int(q) * unit
@@ -4178,7 +4192,7 @@ with t6:
                 if total_cost > 0:
                     st.success(
                         f'예상 종합 ROI {blended_roi:.1f}% · '
-                        f'실전점수와 예산을 함께 반영한 순서입니다.'
+                        f'실전점수·예산·상품당 최대 25% 투자한도를 함께 반영한 순서입니다.'
                     )
 
                     top = buy_list.iloc[0]
@@ -4267,7 +4281,7 @@ with t6:
                     key='telegram_today_v20'
                 ):
                     ok, msg = send_telegram_message(
-                        candidate_telegram_text(buy_list, '🛒 V20 오늘 살 것')
+                        candidate_telegram_text(buy_list, '🛒 V20.1 오늘 살 것')
                     )
                     (st.success if ok else st.error)(msg)
 
@@ -4275,13 +4289,13 @@ with t6:
                     '📥 오늘 살 것 CSV 저장',
                     (buy_list[show_cols] if len(buy_list) else pd.DataFrame(columns=show_cols))
                     .to_csv(index=False).encode('utf-8-sig'),
-                    'today_buy_list_v20.csv',
+                    'today_buy_list_v20_1.csv',
                     'text/csv',
                     width='stretch'
                 )
 
                 st.info(
-                    'V20의 자동선정은 의사결정 보조입니다. '
+                    'V20.1의 자동선정은 의사결정 보조입니다. '
                     '실제 결제 직전에는 롯데/매입처 재고와 최종 결제가, '
                     'POIZON/KREAM의 최신 판매가를 다시 확인하세요.'
                 )
@@ -4306,5 +4320,5 @@ with t6:
                     )
 
     except Exception as e:
-        st.error(f'V20 오늘 살 것 계산 중 오류가 발생했습니다: {e}')
+        st.error(f'V20.1 오늘 살 것 계산 중 오류가 발생했습니다: {e}')
 
