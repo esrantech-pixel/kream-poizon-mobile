@@ -2658,8 +2658,8 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V20.4')
-st.caption('Build: V20.4 · KREAM 실패 자동우회 + 재조회 대기열 + POIZON 결과보존 + 100만원 실전 자동배분')
+st.title('KREAM · POIZON · COUPANG 소싱 V20.5')
+st.caption('Build: V20.5 · 결제 직전 최종 재검증 + POIZON 결과보존 + 100만원 실전 자동배분')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -2952,7 +2952,7 @@ with tf:
 
 
 with tl:
-    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V20.4')
+    st.subheader('🛍️ 롯데백화점 온라인 자동소싱 · V20.5')
     st.caption('아디다스·나이키 후보를 수집한 뒤 품번별 POIZON 공식 API를 일괄 조회해 1차 소싱 후보를 자동 판정합니다. KREAM·쿠팡은 다음 단계에서 BEST 판매처 교차비교로 확장합니다.')
     st.info('첫 테스트는 소량으로 진행합니다. 롯데ON이 자동접근을 제한하거나 페이지 구조를 바꾸면 수집이 멈출 수 있으며, 그 경우 사이트 규정을 우회하지 않고 수집 방식을 조정합니다.')
 
@@ -3084,7 +3084,7 @@ with tl:
         )
         selected=edited[edited['선택']==True] if '선택' in edited.columns else edited.iloc[0:0]
 
-        st.markdown('#### 🚀 V20.4 롯데 후보 → POIZON 1차판정')
+        st.markdown('#### 🚀 V20.5 롯데 후보 → POIZON 1차판정')
         st.caption('롯데에서 잡힌 아디다스·나이키 품번을 POIZON 공식 API로 순차 조회해 실제 판매량이 있는 가격만으로 소싱 가능성을 판정합니다.')
         bc1,bc2=st.columns([1,3])
         _batch_n=bc1.number_input(
@@ -3139,7 +3139,7 @@ with tl:
             else:
                 st.warning('이번 검사 상품에서는 POIZON 기준 매입후보가 없습니다.')
 
-            st.markdown('#### 🔁 V20.4 POIZON 매입후보 → KREAM 자동 교차검증')
+            st.markdown('#### 🔁 V20.5 POIZON 매입후보 → KREAM 보조 교차검증')
             st.caption(
                 'POIZON 1차판정에서 살아남은 상품만 KREAM에서 정확 품번으로 자동 매칭합니다. '
                 '같은 KR 사이즈끼리 즉시판매가·최근체결가·30일 판매량을 비교해 최종 BEST 판매처를 고릅니다.'
@@ -3256,7 +3256,7 @@ with tl:
                     st.caption(str(_m))
 
         # V18.6 one-product end-to-end test: Lotte candidate -> product DB -> POIZON official API.
-        st.markdown('#### 🧪 1개 상품 상세 확인 · V20.4')
+        st.markdown('#### 🧪 1개 상품 상세 확인 · V20.5')
         st.caption('후보 1개를 골라 POIZON 공식 API로 상세검증하고, 아래 KREAM 자동 교차검증으로 동일 품번·동일 KR사이즈를 다시 확인합니다.')
         _test_models=view['품번'].astype(str).tolist() if '품번' in view.columns else []
         if _test_models:
@@ -3369,7 +3369,7 @@ with tl:
                             else:
                                 st.warning('현재 조건에서는 매입 추천 사이즈가 없습니다. 판매량 없는 POIZON 가격은 수익 계산에서 제외했습니다.')
 
-                    st.markdown('##### 🔁 V20.4 KREAM 자동 교차검증')
+                    st.markdown('##### 🔁 V20.5 KREAM 보조 교차검증')
                     st.caption('같은 품번을 KREAM에서 자동 매칭해 즉시판매가(최고 매입입찰)·30일 체결을 가져오고 POIZON과 같은 사이즈로 비교합니다.')
                     if st.button('🔎 KREAM 자동조회 + POIZON 교차비교', type='primary', width='stretch', key='lotte_v188_kream_auto'):
                         try:
