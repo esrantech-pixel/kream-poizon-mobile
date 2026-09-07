@@ -2558,8 +2558,8 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V20.1')
-st.caption('Build: V20.1 · 100만원 예산 자동배분 + 상품당 투자한도 + BEST 사이즈/판매처/수익/회전 통합')
+st.title('KREAM · POIZON · COUPANG 소싱 V20.2')
+st.caption('Build: V20.2 · 100만원 예산 자동배분 + 상품당 투자비율 조절 + 예산 집행률/잔액 진단')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
 with st.sidebar:
@@ -3919,7 +3919,7 @@ with t5:
 ''')
 
 with t6:
-    st.subheader('🛒 오늘 살 것 V20.1')
+    st.subheader('🛒 오늘 살 것 V20.2')
     st.caption(
         '저장 후보 + 현재 롯데 자동소싱 결과를 한곳에 모아 '
         '수익성·ROI·30일 판매량·판정등급을 함께 보고 예산 안에서 오늘 살 상품을 자동선정합니다. '
@@ -4066,6 +4066,16 @@ with t6:
                     key='today_min_sales_v20'
                 )
 
+            c_cap, c_mode = st.columns(2)
+            with c_cap:
+                today_max_product_pct = st.number_input(
+                    '상품 1종 최대 투자비율(%)',
+                    min_value=5.0, max_value=100.0, value=25.0, step=5.0,
+                    key='today_max_product_pct_v202'
+                )
+            with c_mode:
+                st.caption('후보가 여러 개면 한 상품에 예산이 몰리지 않도록 제한합니다. 후보가 적으면 예산이 남는 것이 정상입니다.')
+
             working = all_candidates.copy()
 
             # 실제 구매 가능 후보
@@ -4131,7 +4141,7 @@ with t6:
                 #    - 1개 테스트 판정은 무조건 최대 1개
                 #    - 추천수량/판매량보다 과도하게 사지 않도록 제한
                 # =====================================================
-                max_product_ratio = 0.25
+                max_product_ratio = float(today_max_product_pct) / 100.0
                 remaining = int(today_budget)
                 budget_qty = []
 
@@ -4188,6 +4198,11 @@ with t6:
                 m3.metric('예상 매입금액', f'{total_cost:,.0f}원')
                 m4.metric('예상 총 순익', f'{total_profit:,.0f}원')
                 m5.metric('예산 잔액', f'{remain_budget:,.0f}원')
+                utilization = (total_cost / int(today_budget) * 100) if int(today_budget) > 0 else 0
+                m6.metric('예산 집행률', f'{utilization:.1f}%')
+
+                if len(buy_list) and utilization < 50:
+                    st.info('💡 예산이 많이 남았습니다. 현재 통과 후보/추천수량이 적거나 상품당 투자한도 때문에 남은 금액입니다. 기준을 억지로 낮추기보다 후보를 더 발굴하는 편이 안전합니다.')
 
                 if total_cost > 0:
                     st.success(
@@ -4281,7 +4296,7 @@ with t6:
                     key='telegram_today_v20'
                 ):
                     ok, msg = send_telegram_message(
-                        candidate_telegram_text(buy_list, '🛒 V20.1 오늘 살 것')
+                        candidate_telegram_text(buy_list, '🛒 V20.2 오늘 살 것')
                     )
                     (st.success if ok else st.error)(msg)
 
@@ -4320,5 +4335,5 @@ with t6:
                     )
 
     except Exception as e:
-        st.error(f'V20.1 오늘 살 것 계산 중 오류가 발생했습니다: {e}')
+        st.error(f'V20.2 오늘 살 것 계산 중 오류가 발생했습니다: {e}')
 
