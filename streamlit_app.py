@@ -2563,7 +2563,7 @@ def v19_3_kream_cross_batch(poizon_batch_df, max_products=10):
     return out, messages
 
 
-st.title('KREAM · POIZON · COUPANG 소싱 V20.2')
+st.title('KREAM · POIZON · COUPANG 소싱 V20.3')
 st.caption('Build: V20.3 · KREAM 실패 안전처리 + 100만원 예산 자동배분 + 상품당 투자비율 조절 + 예산 집행률/잔액 진단')
 st.caption('POIZON에서 먼저 잘 팔리는 상품을 찾고 → 한국에서 싸게 소싱한 뒤 → KREAM/POIZON 수익성과 회전율을 비교하는 역소싱 도구입니다.')
 
